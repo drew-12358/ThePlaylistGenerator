@@ -1,0 +1,15 @@
+{
+  "name": "spotify-discover",
+  "version": "1.0.0",
+  "description": "Spotify Discovery Engine — breaks the algorithmic echo chamber using Claude",
+  "main": "discover.mjs",
+  "type": "module",
+  "scripts": {
+    "start": "node discover.mjs"
+  },
+  "private": true,
+  "dependencies": {
+    "dotenv": "^17.3.1",
+    "open": "^9.1.0"
+  }
+}
