@@ -53,7 +53,7 @@ const SCOPES = [
 
 const args = process.argv.slice(2);
 const forceAuth = args.includes("--auth");
-const trackCount = parseInt(args[args.indexOf("--count") + 1]) || 35;
+const trackCount = parseInt(args[args.indexOf("--count") + 1]) || 50;
 const diversity = args[args.indexOf("--diversity") + 1] || "high";
 
 // ---------------------------------------------------------------------------
@@ -104,14 +104,6 @@ async function lastfmGet(method, params = {}) {
   return res.json();
 }
 
-async function getLastfmTopTracks(tag, limit = 15) {
-  const data = await lastfmGet("tag.getTopTracks", { tag, limit });
-  return (data?.tracks?.track || []).map((t) => ({
-    name: t.name,
-    artist: t.artist?.name,
-  }));
-}
-
 async function fetchLastfmUserData() {
   if (!LASTFM_API_KEY) {
     log("No Last.fm API key, skipping user listening data");
@@ -120,11 +112,9 @@ async function fetchLastfmUserData() {
 
   log(`Fetching Last.fm data for user: ${LASTFM_USER}`);
 
-  const [topArtists, topTracks, lovedTracks, recentTracks] = await Promise.all([
+  const [topArtists, topTracks] = await Promise.all([
     lastfmGet("user.getTopArtists", { user: LASTFM_USER, period: "overall", limit: 30 }),
     lastfmGet("user.getTopTracks", { user: LASTFM_USER, period: "overall", limit: 30 }),
-    lastfmGet("user.getLovedTracks", { user: LASTFM_USER, limit: 30 }),
-    lastfmGet("user.getRecentTracks", { user: LASTFM_USER, limit: 50 }),
   ]);
 
   const artists = (topArtists?.topartists?.artist || []).map((a) => ({
@@ -138,55 +128,470 @@ async function fetchLastfmUserData() {
     playCount: parseInt(t.playcount) || 0,
   }));
 
-  const loved = (lovedTracks?.lovedtracks?.track || []).map((t) => ({
-    name: t.name,
-    artist: t.artist?.name,
-  }));
-
-  const recent = (recentTracks?.recenttracks?.track || []).map((t) => ({
-    name: t.name,
-    artist: t.artist?.["#text"] || t.artist?.name,
-  }));
-
-  const hasData = artists.length > 0 || tracks.length > 0 || loved.length > 0;
+  const hasData = artists.length > 0 || tracks.length > 0;
 
   if (!hasData) {
     log("Last.fm account has no scrobble data yet — falling back to Spotify data");
     return null;
   }
 
-  log(`Last.fm: ${artists.length} top artists, ${tracks.length} top tracks, ${loved.length} loved tracks, ${recent.length} recent`);
-  return { artists, tracks, loved, recent };
+  log(`Last.fm: ${artists.length} top artists, ${tracks.length} top tracks`);
+  return { artists, tracks };
 }
 
-async function fetchQualityReferences(genres) {
+async function loadTracklists() {
+  const tracklistsPath = join(homedir(), ".spotify-discover", "tracklists.json");
+  try {
+    const data = JSON.parse(await readFile(tracklistsPath, "utf8"));
+    return data.albums || {};
+  } catch {
+    return {};
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Find candidates: last.fm similar tracks → cross-reference with tracklists
+// ---------------------------------------------------------------------------
+
+async function findCandidates(lastfmData, tasteProfile, libraryData, tracklists, claudeApiKey, targetCount = 60) {
   if (!LASTFM_API_KEY) {
-    log("No Last.fm API key, skipping quality references");
-    return null;
+    throw new Error("Last.fm API key required. Set LASTFM_API_KEY in your .env file.");
   }
 
-  // Pick up to 8 genres to look up
-  const genresToQuery = genres.slice(0, 8);
-  log(`Fetching Last.fm top tracks for: ${genresToQuery.join(", ")}`);
+  logStep("3/4", `Finding ~${targetCount} candidate tracks via Last.fm similarity...`);
 
-  const results = {};
-  // Fetch in parallel batches of 4
-  for (let i = 0; i < genresToQuery.length; i += 4) {
-    const batch = genresToQuery.slice(i, i + 4);
-    const batchResults = await Promise.all(
-      batch.map(async (genre) => {
-        const tracks = await getLastfmTopTracks(genre, 15);
-        return { genre, tracks };
-      })
-    );
-    for (const { genre, tracks } of batchResults) {
-      if (tracks.length > 0) results[genre] = tracks;
+  // Build a lookup: "artist - track" (lowercase) → { album info, spotify uri }
+  const tracklistLookup = new Map();
+  for (const [albumKey, albumData] of Object.entries(tracklists)) {
+    if (!albumData.tracks?.length) continue;
+    for (const track of albumData.tracks) {
+      const key = `${track.artist} - ${track.name}`.toLowerCase();
+      tracklistLookup.set(key, {
+        artist: track.artist,
+        track: track.name,
+        album: albumData.spotifyName || albumData.source?.album,
+        year: albumData.source?.year,
+        rank: albumData.source?.rank,
+        uri: track.uri,
+        albumKey,
+      });
     }
   }
 
-  const totalTracks = Object.values(results).reduce((sum, t) => sum + t.length, 0);
-  log(`Got ${totalTracks} quality reference tracks across ${Object.keys(results).length} genres`);
-  return results;
+  log(`Built lookup of ${tracklistLookup.size} tracks across ${Object.keys(tracklists).length} albums`);
+
+  // Normalize track/album names for fuzzy matching — strips remaster tags, edition info, etc.
+  const normalizeTrack = (str) => str.toLowerCase()
+    .replace(/\s*[-–—]\s*(remaster(ed)?|deluxe|expanded|anniversary|bonus|mono|stereo|single version|album version|radio edit|explicit|clean).*$/i, "")
+    .replace(/\s*\((remaster(ed)?|deluxe|expanded|\d+th anniversary|bonus|mono|stereo|single version|album version|radio edit|explicit|clean)[^)]*\)/gi, "")
+    .replace(/\s*\[(remaster(ed)?|deluxe|expanded|\d+th anniversary|bonus|mono|stereo)[^\]]*\]/gi, "")
+    .replace(/\s*[-–—]\s*\d{4}\s*(remaster(ed)?|version|mix)$/i, "")
+    .trim();
+
+  const trackKey = (artist, name) => `${normalizeTrack(artist)} - ${normalizeTrack(name)}`;
+
+  // Build set of tracks user already knows (to exclude)
+  const knownTracks = new Set();
+
+  // Individual known tracks from Spotify top tracks, liked tracks, last.fm
+  for (const t of tasteProfile.topTracks || []) {
+    if (t.artist && t.name) knownTracks.add(trackKey(t.artist, t.name));
+  }
+  if (libraryData?.likedTracks) {
+    for (const t of libraryData.likedTracks) {
+      if (t.artist && t.name) knownTracks.add(trackKey(t.artist, t.name));
+    }
+  }
+  if (lastfmData?.tracks) {
+    for (const t of lastfmData.tracks) {
+      if (t.artist && t.name) knownTracks.add(trackKey(t.artist, t.name));
+    }
+  }
+
+  // Also exclude ALL tracks from albums the user has saved — if they saved the album, they know it
+  const savedAlbumKeys = new Set();
+  if (libraryData?.savedAlbums) {
+    for (const a of libraryData.savedAlbums) {
+      if (a.artist && a.name) savedAlbumKeys.add(`${a.artist} - ${a.name}`.toLowerCase());
+    }
+  }
+  // Cross-reference saved albums against tracklists to exclude every track
+  for (const [albumKey, albumData] of Object.entries(tracklists)) {
+    const spotifyKey = albumData.spotifyArtist && albumData.spotifyName
+      ? `${albumData.spotifyArtist} - ${albumData.spotifyName}`.toLowerCase()
+      : null;
+    if (savedAlbumKeys.has(albumKey) || (spotifyKey && savedAlbumKeys.has(spotifyKey))) {
+      for (const t of albumData.tracks || []) {
+        knownTracks.add(trackKey(t.artist, t.name));
+      }
+    }
+  }
+
+  log(`Excluding ${knownTracks.size} known tracks (${savedAlbumKeys.size} saved albums expanded)`);
+
+  // Gather seed tracks from multiple sources, ordered by signal strength
+  const seedTracks = [];
+  const addedSeeds = new Set();
+
+  const addSeed = (artist, track, playCount = 0, source = "spotify") => {
+    if (!artist || !track) return;
+    const key = `${artist} - ${track}`.toLowerCase();
+    if (addedSeeds.has(key)) return;
+    addedSeeds.add(key);
+    seedTracks.push({ artist, track, playCount, source });
+  };
+
+  // Last.fm top tracks (strongest signal — actual play counts)
+  if (lastfmData?.tracks?.length > 0) {
+    for (const t of lastfmData.tracks) {
+      addSeed(t.artist, t.name, t.playCount, "lastfm");
+    }
+  }
+
+  // Spotify top tracks across all time ranges
+  for (const t of tasteProfile.topTracks || []) {
+    addSeed(t.artist, t.name, 0, "spotify");
+  }
+
+  // Liked/saved tracks from library (deliberate interest)
+  if (libraryData?.likedTracks) {
+    for (const t of libraryData.likedTracks.slice(0, 30)) {
+      addSeed(t.artist, t.name, 0, "liked");
+    }
+  }
+
+  log(`Gathered ${seedTracks.length} seed tracks`);
+
+  // Analyze decade distribution of seeds and balance with exploration seeds
+  // Target playlist: ~4 tracks 70s, 10 tracks 80s, 10 tracks 90s, 10 tracks 00s, 10 tracks 10s, 6 tracks 20s
+  // Seeds should roughly mirror this ratio to produce balanced candidates
+  // Exploration seed targets per decade — higher for decades with no listening history
+  // The user's own seeds already cover 2010s/2020s, so these need fewer exploration seeds
+  const DECADE_SEED_TARGETS = {
+    "1970s": 4, "1980s": 6, "1990s": 5, "2000s": 4, "2010s": 2, "2020s": 3,
+  };
+
+  const seedDecades = new Map();
+  for (const s of seedTracks) {
+    const key = `${s.artist} - ${s.track}`.toLowerCase();
+    const info = tracklistLookup.get(key);
+    if (info?.year) {
+      const decade = `${Math.floor(info.year / 10) * 10}s`;
+      seedDecades.set(decade, (seedDecades.get(decade) || 0) + 1);
+    }
+  }
+
+  const decadeGaps = [];
+  for (const [decade, target] of Object.entries(DECADE_SEED_TARGETS)) {
+    const current = seedDecades.get(decade) || 0;
+    const needed = Math.max(0, target - current);
+    if (needed > 0) decadeGaps.push({ decade, needed, current });
+  }
+
+  if (decadeGaps.length > 0) {
+    log(`Seed decade balance: ${Object.entries(DECADE_SEED_TARGETS).map(([d]) => `${d}: ${seedDecades.get(d) || 0}`).join(", ")}`);
+    log(`Adding exploration seeds for: ${decadeGaps.map((g) => `${g.decade} (+${g.needed})`).join(", ")}`);
+
+    // Collect candidate albums for exploration, one per year per decade
+    const explorationAlbums = [];
+    for (const { decade, needed } of decadeGaps) {
+      const decadeStart = parseInt(decade);
+      const decadeEnd = decadeStart + 9;
+
+      const decadeAlbums = [];
+      for (const [albumKey, albumData] of Object.entries(tracklists)) {
+        const year = albumData.source?.year;
+        const rank = albumData.source?.rank;
+        if (year >= decadeStart && year <= decadeEnd && rank && albumData.tracks?.length > 0) {
+          decadeAlbums.push({ albumKey, albumData, year, rank });
+        }
+      }
+      decadeAlbums.sort((a, b) => a.rank - b.rank || a.year - b.year);
+
+      const usedYears = new Set();
+      let added = 0;
+      for (const da of decadeAlbums) {
+        if (added >= needed) break;
+        if (usedYears.has(da.year)) continue;
+        usedYears.add(da.year);
+        explorationAlbums.push(da);
+        added++;
+      }
+      // Fill remaining from top-ranked if needed
+      for (const da of decadeAlbums) {
+        if (added >= needed) break;
+        if (!explorationAlbums.includes(da)) {
+          explorationAlbums.push(da);
+          added++;
+        }
+      }
+    }
+
+    // Ask Claude to pick the best seed track from each exploration album (single batch call)
+    const albumListForClaude = explorationAlbums.map((da, i) => {
+      const tracks = da.albumData.tracks.map((t, j) => `  ${j + 1}. ${t.name}`).join("\n");
+      return `Album ${i + 1}: ${da.albumData.spotifyArtist || da.albumData.source?.artist} - ${da.albumData.spotifyName || da.albumData.source?.album} (${da.year})\n${tracks}`;
+    }).join("\n\n");
+
+    const pickPrompt = `For each album below, pick the ONE track that would work best as a seed for Last.fm's track.getSimilar API. Choose the most iconic, distinctive, or genre-defining track — not an intro, interlude, or deep album cut.
+
+${albumListForClaude}
+
+Respond with ONLY a JSON object. The key "picks" maps to an array of track numbers (1-indexed), one per album in order.
+Example: {"picks": [3, 5, 2, 7, ...]}`;
+
+    const pickRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": claudeApiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: 1024,
+        messages: [{ role: "user", content: pickPrompt }],
+      }),
+    });
+
+    if (!pickRes.ok) {
+      throw new Error(`Track pick API failed (${pickRes.status}): ${await pickRes.text()}`);
+    }
+
+    const pickData = await pickRes.json();
+    const pickText = pickData.content?.[0]?.text || "";
+    const pickMatch = pickText.match(/\[\s*(?:\d+\s*,\s*)*\d+\s*\]/);
+    if (!pickMatch) {
+      throw new Error(`Track pick returned no JSON array. Response: ${pickText.slice(0, 300)}`);
+    }
+    const picks = JSON.parse(pickMatch[0]);
+
+    for (let i = 0; i < explorationAlbums.length; i++) {
+      const da = explorationAlbums[i];
+      const trackIdx = (picks[i] || 1) - 1; // Claude's pick (1-indexed) or fallback to track 1
+      const tracks = da.albumData.tracks;
+      const pick = tracks[Math.min(trackIdx, tracks.length - 1)];
+      if (pick && !addedSeeds.has(`${pick.artist} - ${pick.name}`.toLowerCase())) {
+        addSeed(pick.artist, pick.name, 0, `explore-${da.year}`);
+      }
+    }
+
+    log(`Total seeds after exploration: ${seedTracks.length}`);
+  }
+
+  // Ask Claude to pick the best 20 diverse seeds from the full list
+  const seedListForClaude = seedTracks.map((s, i) =>
+    `${i + 1}. ${s.artist} - ${s.track} [${s.source}${s.playCount ? `, ${s.playCount} plays` : ""}]`
+  ).join("\n");
+
+  const seedPrompt = `You are selecting seed tracks for a music discovery algorithm. The seeds will be fed into Last.fm's track.getSimilar API to find new music.
+
+Here are all ${seedTracks.length} candidate seeds from the user's listening history:
+
+${seedListForClaude}
+
+TASK: Pick exactly 30 seeds that will produce a decade-balanced playlist.
+
+SELECTION RULES:
+- Pick at least 15 seeds from the user's actual listening history (lastfm/spotify/liked sources). These anchor the playlist in their taste and ensure modern decades (2010s/2020s) are represented.
+- Pick the remaining ~15 seeds from exploration tracks (tagged [explore-YEAR]) spread across underrepresented decades: 70s, 80s, 90s, 00s
+- Don't pick more than 2 tracks from the same artist
+- Spread across genres, moods, and energy levels
+- Prefer tracks that are distinctive or genre-defining — they'll produce better similarity results
+
+You MUST respond with ONLY a JSON object, no reasoning or explanation. Just the JSON.
+{"seeds": [3, 7, 12, 15, ...]}`;
+
+  const seedRes = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": claudeApiKey,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-6",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: seedPrompt }],
+    }),
+  });
+
+  if (!seedRes.ok) {
+    const err = await seedRes.text();
+    throw new Error(`Seed selection API failed (${seedRes.status}): ${err}`);
+  }
+
+  const seedData = await seedRes.json();
+  const seedText = seedData.content?.[0]?.text || "";
+  const seedArrayMatch = seedText.match(/\[\s*(?:\d+\s*,\s*)*\d+\s*\]/);
+  if (!seedArrayMatch) {
+    throw new Error(`Seed selection returned no JSON array. Response: ${seedText.slice(0, 300)}`);
+  }
+  const seedIndices = JSON.parse(seedArrayMatch[0]);
+  const selectedSeeds = seedIndices
+    .filter((i) => i >= 1 && i <= seedTracks.length)
+    .map((i) => seedTracks[i - 1]);
+
+  log(`Claude selected ${selectedSeeds.length} diverse seeds:`);
+  for (const s of selectedSeeds) {
+    log(`  [${s.source}${s.playCount ? ` ${s.playCount} plays` : ""}] ${s.artist} - ${s.track}`);
+  }
+
+  // Process seeds until we have enough candidates
+  // Cap at 3 matches per seed to ensure diversity across different taste signals
+  const MAX_PER_SEED = 3;
+  const matches = [];
+  const seenTracks = new Set();
+  const seenArtists = new Map(); // artist → count (cap per artist too)
+  const MAX_PER_ARTIST = 3;
+  let apiCalls = 0;
+  let seedIndex = 0;
+
+  while (matches.length < targetCount && seedIndex < selectedSeeds.length) {
+    const seed = selectedSeeds[seedIndex];
+    seedIndex++;
+
+    // Find which album the seed is from (so we don't recommend more from the same album)
+    const seedKey = `${seed.artist} - ${seed.track}`.toLowerCase();
+    const seedAlbum = tracklistLookup.get(seedKey)?.album?.toLowerCase() || null;
+
+    try {
+      const data = await lastfmGet("track.getSimilar", {
+        artist: seed.artist,
+        track: seed.track,
+        limit: 50,
+      });
+
+      apiCalls++;
+      const similarTracks = data?.similartracks?.track || [];
+      let seedMatches = 0;
+
+      for (const sim of similarTracks) {
+        if (seedMatches >= MAX_PER_SEED) break;
+
+        const simArtist = sim.artist?.name || "";
+        const simTrack = sim.name || "";
+        const key = `${simArtist} - ${simTrack}`.toLowerCase();
+        const normalizedKey = trackKey(simArtist, simTrack);
+        const artistLower = simArtist.toLowerCase();
+
+        // Skip if already found, user already knows it, or artist is over-represented
+        if (seenTracks.has(key) || knownTracks.has(normalizedKey)) continue;
+        if ((seenArtists.get(artistLower) || 0) >= MAX_PER_ARTIST) continue;
+
+        // Check if this track exists in our best-album tracklists
+        if (tracklistLookup.has(key)) {
+          // Skip tracks from the same album as the seed — user already knows that album
+          const info = tracklistLookup.get(key);
+          const matchAlbum = info.album?.toLowerCase();
+          if (seedAlbum && matchAlbum === seedAlbum) continue;
+
+          seenTracks.add(key);
+          seenArtists.set(artistLower, (seenArtists.get(artistLower) || 0) + 1);
+          matches.push({
+            artist: info.artist,
+            track: info.track,
+            album: info.album,
+            year: info.year,
+            rank: info.rank,
+            uri: info.uri,
+            similarTo: `${seed.artist} - ${seed.track}`,
+            seedPlayCount: seed.playCount,
+            matchScore: parseFloat(sim.match) || 0,
+          });
+          seedMatches++;
+        }
+      }
+
+      // Progress update every 10 seeds
+      if (apiCalls % 10 === 0) {
+        log(`  ${matches.length} candidates found after ${apiCalls} lookups (${selectedSeeds.length - seedIndex} seeds remaining)`);
+      }
+
+      // Small delay to be nice to the API
+      await new Promise((r) => setTimeout(r, 200));
+    } catch (err) {
+      // Skip failed lookups, don't break the pipeline
+    }
+  }
+
+  // If Claude's 20 seeds didn't produce enough, fall back to remaining seeds
+  if (matches.length < targetCount && selectedSeeds !== seedTracks) {
+    const usedSeedKeys = new Set(selectedSeeds.map((s) => `${s.artist} - ${s.track}`.toLowerCase()));
+    const remainingSeeds = seedTracks.filter((s) => !usedSeedKeys.has(`${s.artist} - ${s.track}`.toLowerCase()));
+    log(`  Only ${matches.length} candidates from curated seeds, trying ${remainingSeeds.length} remaining seeds...`);
+
+    let remIndex = 0;
+    while (matches.length < targetCount && remIndex < remainingSeeds.length) {
+      const seed = remainingSeeds[remIndex];
+      remIndex++;
+
+      try {
+        const data = await lastfmGet("track.getSimilar", {
+          artist: seed.artist,
+          track: seed.track,
+          limit: 50,
+        });
+
+        apiCalls++;
+        const similarTracks = data?.similartracks?.track || [];
+        let seedMatches = 0;
+
+        for (const sim of similarTracks) {
+          if (seedMatches >= MAX_PER_SEED) break;
+          const simArtist = sim.artist?.name || "";
+          const simTrack = sim.name || "";
+          const key = `${simArtist} - ${simTrack}`.toLowerCase();
+          const normalizedKey = trackKey(simArtist, simTrack);
+          const artistLower = simArtist.toLowerCase();
+
+          if (seenTracks.has(key) || knownTracks.has(normalizedKey)) continue;
+          if ((seenArtists.get(artistLower) || 0) >= MAX_PER_ARTIST) continue;
+
+          if (tracklistLookup.has(key)) {
+            seenTracks.add(key);
+            seenArtists.set(artistLower, (seenArtists.get(artistLower) || 0) + 1);
+            const info = tracklistLookup.get(key);
+            matches.push({
+              artist: info.artist,
+              track: info.track,
+              album: info.album,
+              year: info.year,
+              rank: info.rank,
+              uri: info.uri,
+              similarTo: `${seed.artist} - ${seed.track}`,
+              seedPlayCount: seed.playCount,
+              matchScore: parseFloat(sim.match) || 0,
+            });
+            seedMatches++;
+          }
+        }
+
+        if (apiCalls % 10 === 0) {
+          log(`  ${matches.length} candidates found after ${apiCalls} lookups (${remainingSeeds.length - remIndex} fallback seeds remaining)`);
+        }
+
+        await new Promise((r) => setTimeout(r, 200));
+      } catch (err) {
+        // Skip failed lookups
+      }
+    }
+  }
+
+  // Sort by match score (strongest similarity first)
+  matches.sort((a, b) => b.matchScore - a.matchScore);
+
+  log(`Found ${matches.length} candidate tracks from ${apiCalls} Last.fm lookups`);
+
+  if (matches.length === 0) {
+    throw new Error("No candidate tracks found. This can happen if tracklists.json is empty — run 'node fetch-tracklists.mjs' first.");
+  }
+
+  if (matches.length < targetCount) {
+    log(`Note: only found ${matches.length} candidates (target was ${targetCount}). Proceeding with what we have.`);
+  }
+
+  return matches;
 }
 
 // ---------------------------------------------------------------------------
@@ -416,7 +821,7 @@ async function refreshToken(config, refreshTokenStr) {
 // Spotify API helpers
 // ---------------------------------------------------------------------------
 
-async function spotifyGet(endpoint, accessToken, params = {}) {
+async function spotifyGet(endpoint, accessToken, params = {}, _retries = 0) {
   const url = new URL(`https://api.spotify.com/v1${endpoint}`);
   Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
 
@@ -425,10 +830,11 @@ async function spotifyGet(endpoint, accessToken, params = {}) {
   });
 
   if (res.status === 429) {
-    const retryAfter = parseInt(res.headers.get("retry-after") || "2");
-    log(`Rate limited, waiting ${retryAfter}s...`);
+    if (_retries >= 5) throw new Error(`Spotify rate limit on ${endpoint} after ${_retries} retries`);
+    const retryAfter = Math.min(parseInt(res.headers.get("retry-after") || "2"), 30);
+    log(`Rate limited, waiting ${retryAfter}s... (attempt ${_retries + 1}/5)`);
     await new Promise((r) => setTimeout(r, retryAfter * 1000));
-    return spotifyGet(endpoint, accessToken, params);
+    return spotifyGet(endpoint, accessToken, params, _retries + 1);
   }
 
   if (!res.ok) {
@@ -483,7 +889,7 @@ async function spotifyPut(endpoint, accessToken, body) {
 // ---------------------------------------------------------------------------
 
 async function gatherTasteProfile(accessToken) {
-  logStep("1/6", "Reading your Spotify taste profile...");
+  logStep("1/4", "Reading your Spotify taste profile...");
 
   // Pull all three time ranges for both artists and tracks, plus recently played
   const [
@@ -574,7 +980,7 @@ async function gatherTasteProfile(accessToken) {
 // ---------------------------------------------------------------------------
 
 async function scanSavedLibrary(accessToken, tasteProfile) {
-  logStep("2/6", "Scanning your saved library for broader taste signals...");
+  logStep("2/4", "Scanning your saved library for broader taste signals...");
 
   // Build genre lookup from top artists (the only source that reliably returns genres in Dev Mode)
   const genreLookup = new Map();
@@ -726,319 +1132,99 @@ async function scanSavedLibrary(accessToken, tasteProfile) {
 }
 
 // ---------------------------------------------------------------------------
-// Claude gap analysis
+// (getRecommendations removed — findCandidates generates candidates purely from data)
+
+// ---------------------------------------------------------------------------
+// Anti-clustering: spread same-artist/album/seed tracks apart
 // ---------------------------------------------------------------------------
 
-async function analyzeGaps(tasteProfile, libraryData, claudeApiKey, lastfmData) {
-  logStep("3/6", "Analyzing taste gaps with Claude...");
+function antiCluster(tracks) {
+  if (tracks.length <= 2) return tracks;
 
-  // --- Build rich library section ---
-  const libraryParts = [];
+  // Constraint-based ordering: build the sequence one track at a time,
+  // always picking the track that's most "different" from the last placed track
+  const remaining = [...tracks];
+  const result = [];
 
-  if (libraryData) {
-    if (Object.keys(libraryData.libraryGenres).length > 0) {
-      libraryParts.push(`SAVED LIBRARY GENRES (broader than recent listening):
-${Object.entries(libraryData.libraryGenres).slice(0, 30).map(([g, c]) => `  ${g}: ${c}`).join("\n")}`);
-    }
+  // Start with the first track
+  result.push(remaining.shift());
 
-    if (libraryData.libraryArtists?.length > 0) {
-      const notInRecent = libraryData.libraryArtists.filter(
-        (a) => !tasteProfile.topArtists.some((ta) => ta.name === a) && !tasteProfile.recentArtistNames.includes(a)
-      );
-      libraryParts.push(`LIBRARY ARTISTS NOT IN RECENT LISTENING: ${notInRecent.slice(0, 25).join(", ")}`);
-    }
+  while (remaining.length > 0) {
+    const last = result[result.length - 1];
+    const lastArtist = last.artist?.toLowerCase();
+    const lastAlbum = last.album?.toLowerCase();
+    const lastSeed = last.similarTo;
+    const lastDecade = last.year ? Math.floor(last.year / 10) * 10 : null;
 
-    if (libraryData.followedArtists?.length > 0) {
-      const withGenres = libraryData.followedArtists.filter((a) => a.genres.length > 0);
-      const withoutGenres = libraryData.followedArtists.filter((a) => a.genres.length === 0);
-      let followedStr = "";
-      if (withGenres.length > 0) {
-        followedStr += withGenres.slice(0, 30).map((a) => `  ${a.name} (${a.genres.slice(0, 3).join(", ")})`).join("\n");
+    // Score each remaining track — higher = more different from last placed
+    let bestIdx = 0;
+    let bestScore = -1;
+
+    for (let i = 0; i < remaining.length; i++) {
+      const t = remaining[i];
+      let score = 0;
+
+      // Hard penalties for same artist/album/seed
+      if (t.artist?.toLowerCase() !== lastArtist) score += 10;
+      if (!lastAlbum || !t.album || t.album.toLowerCase() !== lastAlbum) score += 10;
+      if (!lastSeed || t.similarTo !== lastSeed) score += 10;
+
+      // Soft bonus for different decade
+      const tDecade = t.year ? Math.floor(t.year / 10) * 10 : null;
+      if (tDecade && lastDecade && tDecade !== lastDecade) score += 3;
+
+      // Small bonus for being further back in the remaining list (preserves some of Claude's ordering)
+      score += Math.min(i * 0.1, 2);
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestIdx = i;
       }
-      if (withoutGenres.length > 0) {
-        if (followedStr) followedStr += "\n";
-        followedStr += `  ${withoutGenres.slice(0, 30).map((a) => a.name).join(", ")}`;
-      }
-      libraryParts.push(`DELIBERATELY FOLLOWED ARTISTS (intentional interest, not algorithmic):\n${followedStr}`);
     }
 
-    if (libraryData.likedTracks?.length > 0) {
-      libraryParts.push(`LIKED/SAVED TRACKS (user deliberately hearted these — strongest Spotify quality signal):
-${libraryData.likedTracks.slice(0, 25).map((t) => `  ${t.artist} - ${t.name}`).join("\n")}`);
-    }
-
-    if (libraryData.savedAlbums?.length > 0) {
-      libraryParts.push(`SAVED ALBUMS (shows deliberate album-level interest):
-${libraryData.savedAlbums.slice(0, 20).map((a) => `  ${a.artist} — ${a.name} (${a.releaseDate || "unknown"})`).join("\n")}`);
-    }
-
-    if (libraryData.decadeCounts && Object.keys(libraryData.decadeCounts).length > 0) {
-      const decades = Object.entries(libraryData.decadeCounts).sort((a, b) => a[0].localeCompare(b[0]));
-      libraryParts.push(`DECADE DISTRIBUTION OF SAVED ALBUMS: ${decades.map(([d, c]) => `${d}: ${c}`).join(", ")}`);
-    }
-
+    result.push(remaining.splice(bestIdx, 1)[0]);
   }
 
-  // --- Build taste trajectory section ---
-  const trajectoryParts = [];
-  if (tasteProfile.longTermOnlyArtists?.length > 0) {
-    trajectoryParts.push(`FADING INTERESTS (in long-term top artists but NOT short-term — possible abandoned tastes):
-${tasteProfile.longTermOnlyArtists.slice(0, 10).map((a) => `  ${a.name} (${a.genres.slice(0, 3).join(", ")})`).join("\n")}`);
-  }
-  if (tasteProfile.shortTermOnlyArtists?.length > 0) {
-    trajectoryParts.push(`NEW/TRENDING INTERESTS (in short-term top artists but NOT long-term — recent discoveries):
-${tasteProfile.shortTermOnlyArtists.slice(0, 10).map((a) => `  ${a.name} (${a.genres.slice(0, 3).join(", ")})`).join("\n")}`);
-  }
-
-  // --- Build Last.fm section ---
-  let lastfmSection = "";
-  if (lastfmData) {
-    const lfmParts = [];
-    if (lastfmData.artists.length > 0) {
-      lfmParts.push(`LAST.FM TOP ARTISTS (with actual play counts — this is the most reliable taste signal):
-${lastfmData.artists.slice(0, 20).map((a) => `  ${a.name}: ${a.playCount} plays`).join("\n")}`);
-    }
-    if (lastfmData.tracks.length > 0) {
-      lfmParts.push(`LAST.FM TOP TRACKS (with play counts):
-${lastfmData.tracks.slice(0, 20).map((t) => `  ${t.artist} - ${t.name}: ${t.playCount} plays`).join("\n")}`);
-    }
-    if (lastfmData.loved.length > 0) {
-      lfmParts.push(`LAST.FM LOVED TRACKS (user explicitly marked these as favourites — strongest quality signal):
-${lastfmData.loved.slice(0, 20).map((t) => `  ${t.artist} - ${t.name}`).join("\n")}`);
-    }
-    if (lfmParts.length > 0) {
-      lastfmSection = "\n\n" + lfmParts.join("\n\n");
-    }
-  }
-
-  const librarySection = libraryParts.length > 0 ? "\n" + libraryParts.join("\n\n") : "";
-  const trajectorySection = trajectoryParts.length > 0 ? "\n\nTASTE TRAJECTORY:\n" + trajectoryParts.join("\n\n") : "";
-
-  const prompt = `You are analyzing a Spotify user's taste profile to identify gaps between their true tastes and what Spotify's algorithm has been feeding them.
-
-RECENT LISTENING DATA (what Spotify's algorithm shows):
-Top artists (with time range): ${tasteProfile.topArtists.map((a) => `${a.name} [${a.sources.join("+")}] (${a.genres.join(", ")})`).join("; ")}
-
-Top tracks: ${tasteProfile.topTracks.map((t) => `${t.artist} - ${t.name} [${t.releaseDate || "?"}] (${t.sources.join("+")})`).join("; ")}
-
-Recently played artists: ${tasteProfile.recentArtistNames.join(", ")}
-
-All genres across profile: ${tasteProfile.allGenres.join(", ")}
-${trajectorySection}
-${librarySection}
-${lastfmSection}
-
-TASK: You are generating interview questions to help personalize music recommendations. Analyze the FULL taste profile above — artists, tracks, play counts, followed artists, saved albums, decade distribution, taste trajectory, and Last.fm data (if available) — to identify:
-1. 3-5 specific, interesting gaps or tensions in their listening (e.g. an artist they follow but never play, a decade they save albums from but don't stream, a genre trajectory that shifted, production styles they seem drawn to)
-2. Genres or patterns that appear overrepresented in recent listening (possible algorithmic echo chamber)
-3. For each gap, write a unique, specific conversational question referencing concrete details from their profile (they'll answer y/n/sometimes)
-
-IMPORTANT:
-- Be specific and creative. Don't ask generic questions like "do you still enjoy [genre]?" — instead reference specific tracks, albums, followed artists, eras, production styles, or connections you notice.
-- USE THE TASTE TRAJECTORY: if an artist is fading (long-term only) or new (short-term only), that's interesting — ask about it specifically.
-- USE FOLLOWED ARTISTS: if they follow someone they don't listen to, that's a signal worth exploring.
-- USE DECADE DATA: if their saved albums span the 70s-2020s but they only stream 2020s, ask about that.
-- Look at the TRACKS and ARTISTS, not just genre labels. Two users with "rock" in their genres could have wildly different tastes.
-- Find unexpected connections — e.g. if someone listens to both ambient electronic and post-rock, ask about the shared atmospheric quality rather than either genre label.
-
-Respond with ONLY valid JSON, no other text:
-{
-  "gaps": [
-    { "area": "genre or style name", "question": "Short question about this area" }
-  ],
-  "biases": ["One sentence about each detected bias"],
-  "summary": "One sentence summary of the profile analysis"
-}`;
-
-  console.log("\n--- GAP ANALYSIS PROMPT ---\n");
-  console.log(prompt);
-  console.log("\n--- END PROMPT ---\n");
-
-  try {
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": claudeApiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-6",
-        max_tokens: 16384,
-        messages: [{ role: "user", content: prompt }],
-      }),
-    });
-
-    if (!res.ok) {
-      const err = await res.text();
-      log(`Gap analysis failed (${res.status}), continuing without interview...`);
-      return null;
-    }
-
-    const data = await res.json();
-    const text = data.content?.[0]?.text || "";
-    const jsonStr = text.replace(/```json\s*|```\s*/g, "").trim();
-    const analysis = JSON.parse(jsonStr);
-
-    log(`Identified ${analysis.gaps?.length || 0} taste gaps`);
-    return analysis;
-  } catch (err) {
-    log(`Gap analysis error: ${err.message}, continuing without interview...`);
-    return null;
-  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------
-// Taste interview
+// Curate and sequence the playlist
 // ---------------------------------------------------------------------------
 
-async function conductTasteInterview(analysis) {
-  logStep("4/6", "Quick taste check...");
+async function curatePlaylist(resolvedTracks, claudeApiKey, targetCount) {
+  logStep("3b/4", `Curating ${targetCount} tracks from ${resolvedTracks.length} candidates into a cohesive playlist...`);
 
-  const readline = await import("node:readline");
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  const ask = (q) => new Promise((res) => rl.question(q, res));
+  const trackList = resolvedTracks.map((t, i) => {
+    const matchPct = t.matchScore != null ? `${(t.matchScore * 100).toFixed(0)}%` : "?";
+    const genres = t.genres?.length > 0 ? ` | genre: ${t.genres.join(", ")}` : "";
+    return `${i + 1}. ${t.artist} — ${t.name} | album: ${t.album || "?"} (${t.year || "?"}) | match: ${matchPct} | seed: ${t.similarTo || t.seedInfo || "?"}${genres}`;
+  }).join("\n");
 
-  if (analysis?.summary) {
-    console.log(`\n  Claude's analysis: ${analysis.summary}\n`);
-  }
+  const prompt = `You are a playlist curator. You have ${resolvedTracks.length} candidate tracks. You MUST select EXACTLY ${targetCount} of them — no more, no less. You are CUTTING ${resolvedTracks.length - targetCount} tracks. Arrange the selected ${targetCount} in an order that flows well.
 
-  if (analysis?.biases?.length) {
-    for (const bias of analysis.biases) {
-      console.log(`  ⚠ ${bias}`);
-    }
-    console.log("");
-  }
+CANDIDATE TRACKS:
+${trackList}
 
-  // Two simple freeform questions — more useful than y/n gap questions
-  const feedback = (await ask("  Anything you loved or hated from recent discoveries? (optional): ")).trim() || null;
-  const mood = (await ask("  What vibe are you after? (optional, e.g. 'boundary-pushing pop', 'late night driving'): ")).trim() || null;
-  console.log("");
+TASK: Select EXACTLY ${targetCount} tracks. You MUST cut ${resolvedTracks.length - targetCount} tracks. Return exactly ${targetCount} track numbers.
 
-  rl.close();
+WHAT TO CUT:
+- GENRE BALANCE: No single genre should exceed ~25% of the final playlist (~${Math.round(targetCount * 0.25)} tracks). If you see 15 hip-hop candidates, you must cut most of them. Same for any genre that dominates. The playlist should feel like a diverse music collection, not a genre playlist.
+- DECADE BALANCE: Target approximately: 4 tracks from the 70s, 10 from the 80s, 10 from the 90s, 10 from the 00s, 10 from the 10s, 6 from the 20s. This is the most important rule — the playlist must span all decades.
+- Tracks with match scores below 10% UNLESS they're genuinely adventurous or unexpected picks. A 5% deep cut from an interesting artist is worth keeping. A 0% classic rock radio staple everyone already knows is not.
+- If an artist appears 3+ times, cut down to the best 2
+- If multiple tracks share the same seed source, keep the strongest 1-2 and cut the rest
+- Between two tracks that serve the same mood/energy/genre role, cut the weaker one
 
-  return {
-    feedback,
-    mood,
-    biases: analysis?.biases || [],
-    summary: analysis?.summary || null,
-  };
-}
+HOW TO ORDER THE ${targetCount} YOU KEEP:
+- ANTI-CLUSTERING: NEVER place two tracks from the same artist, album, or seed next to each other. If you have 2 tracks from Artist X, place them at least 10 positions apart. Same for tracks from the same genre — don't put 3 hip-hop tracks in a row.
+- Flow naturally — think energy, mood, tempo, genre transitions between adjacent tracks
+- Create an arc: inviting opener, builds, shifts genre/mood a few times, satisfying closer
+- Alternate decades — interleave older and newer tracks throughout
 
-// ---------------------------------------------------------------------------
-// Claude recommendation engine
-// ---------------------------------------------------------------------------
+Respond with a JSON object containing a single key "tracks" whose value is an array of exactly ${targetCount} track numbers (1-indexed). Do NOT include any reasoning, just the JSON.
 
-async function getRecommendations(tasteProfile, claudeApiKey, interviewResults, libraryData, qualityRefs, lastfmData) {
-  logStep("5/6", "Asking Claude for genuinely diverse recommendations...");
-
-  const diversityInstructions = {
-    low: "Suggest artists that are somewhat related but not the most obvious choices. Include a few from adjacent genres.",
-    medium:
-      "Push beyond the obvious. At least half should be from different genres, decades, or scenes than the user typically listens to. Include some wildcards.",
-    high: "Be bold. Most recommendations should come from genres, decades, countries, or scenes the user has NOT been listening to. Find connections through production style, energy, instrumentation, lyrical themes, or emotional quality rather than genre labels. Include artists from non-English-speaking markets. Surprise them.",
-  };
-
-  // Build rich library section for recommendations
-  const recLibParts = [];
-  if (libraryData) {
-    recLibParts.push(`SAVED LIBRARY GENRES: ${Object.entries(libraryData.libraryGenres).slice(0, 20).map(([g, c]) => `${g} (${c})`).join(", ")}`);
-
-    const notInRecent = libraryData.libraryArtists?.filter(
-      (a) => !tasteProfile.topArtists.some((ta) => ta.name === a) && !tasteProfile.recentArtistNames.includes(a)
-    ) || [];
-    if (notInRecent.length > 0) {
-      recLibParts.push(`LIBRARY ARTISTS NOT IN RECENT LISTENING: ${notInRecent.slice(0, 20).join(", ")}`);
-    }
-
-    if (libraryData.followedArtists?.length > 0) {
-      recLibParts.push(`DELIBERATELY FOLLOWED ARTISTS: ${libraryData.followedArtists.slice(0, 25).map((a) => a.genres.length > 0 ? `${a.name} (${a.genres.slice(0, 2).join(", ")})` : a.name).join(", ")}`);
-    }
-
-    if (libraryData.savedAlbums?.length > 0) {
-      recLibParts.push(`SAVED ALBUMS: ${libraryData.savedAlbums.slice(0, 15).map((a) => `${a.artist} — ${a.name} (${a.releaseDate || "?"})`).join("; ")}`);
-    }
-
-    if (libraryData.decadeCounts && Object.keys(libraryData.decadeCounts).length > 0) {
-      const decades = Object.entries(libraryData.decadeCounts).sort((a, b) => a[0].localeCompare(b[0]));
-      recLibParts.push(`DECADE DISTRIBUTION: ${decades.map(([d, c]) => `${d}: ${c}`).join(", ")}`);
-    }
-
-  }
-
-  // Last.fm data (when available — has play counts which Spotify doesn't expose)
-  if (lastfmData) {
-    if (lastfmData.artists.length > 0) {
-      recLibParts.push(`LAST.FM TOP ARTISTS (with real play counts):\n${lastfmData.artists.slice(0, 15).map((a) => `  ${a.name}: ${a.playCount} plays`).join("\n")}`);
-    }
-    if (lastfmData.tracks.length > 0) {
-      recLibParts.push(`LAST.FM TOP TRACKS (with real play counts):\n${lastfmData.tracks.slice(0, 15).map((t) => `  ${t.artist} - ${t.name}: ${t.playCount} plays`).join("\n")}`);
-    }
-    if (lastfmData.loved.length > 0) {
-      recLibParts.push(`LAST.FM LOVED TRACKS (explicitly marked as favourites — strongest signal of what this user considers quality):\n${lastfmData.loved.slice(0, 15).map((t) => `  ${t.artist} - ${t.name}`).join("\n")}`);
-    }
-  }
-
-  const prompt = `You are a music discovery engine designed to break people out of algorithmic echo chambers.
-
-Here is the user's current Spotify taste profile:
-
-TOP ARTISTS (with time range — short=last 4 weeks, medium=~6 months, long=~1 year):
-${tasteProfile.topArtists.map((a) => `${a.name} [${a.sources.join("+")}] (${a.genres.join(", ")})`).join("; ")}
-
-TOP TRACKS (with release date and time range):
-${tasteProfile.topTracks.map((t) => `${t.artist} - ${t.name} [${t.releaseDate || "?"}] (${t.sources.join("+")})`).join("; ")}
-
-RECENTLY PLAYED ARTISTS: ${tasteProfile.recentArtistNames.join(", ")}
-
-ALL GENRES: ${tasteProfile.allGenres.join(", ")}
-
-${tasteProfile.longTermOnlyArtists?.length > 0 ? `FADING INTERESTS (long-term only, not in recent listening):
-${tasteProfile.longTermOnlyArtists.slice(0, 10).map((a) => `${a.name} (${a.genres.slice(0, 3).join(", ")})`).join("; ")}` : ""}
-
-${tasteProfile.shortTermOnlyArtists?.length > 0 ? `NEW/TRENDING (short-term only, recent discoveries):
-${tasteProfile.shortTermOnlyArtists.slice(0, 10).map((a) => `${a.name} (${a.genres.slice(0, 3).join(", ")})`).join("; ")}` : ""}
-
-DIVERSITY LEVEL: ${diversity}
-${diversityInstructions[diversity] || diversityInstructions.high}
-
-${recLibParts.length > 0 ? `SAVED LIBRARY ANALYSIS:\n${recLibParts.join("\n")}` : ""}
-
-${interviewResults ? `USER INPUT:
-- Taste analysis: ${interviewResults.summary || "N/A"}
-- Algorithmic biases detected: ${interviewResults.biases?.join("; ") || "None"}
-${interviewResults.feedback ? `- User feedback on recent discoveries: "${interviewResults.feedback}" — USE THIS TO GUIDE RECOMMENDATIONS. If they loved something, find more like it. If they hated something, avoid that direction.` : ""}
-${interviewResults.mood ? `- Requested vibe: "${interviewResults.mood}" — weight recommendations toward this mood/feel.` : ""}
-
-Use the taste trajectory (fading vs new interests), followed artists, saved albums, and user-created playlists to understand their TRUE breadth.
-Counteract the algorithmic biases detected above.
-Prioritise underrepresented decades/genres from their library.` : ""}
-
-${qualityRefs && Object.keys(qualityRefs).length > 0 ? `QUALITY REFERENCE — TOP TRACKS BY GENRE (from Last.fm, ranked by dedicated listeners):
-${Object.entries(qualityRefs).map(([genre, tracks]) => `  ${genre}: ${tracks.map((t) => `${t.artist} - ${t.name}`).join("; ")}`).join("\n")}
-
-Use these as a quality benchmark — these are tracks that dedicated music listeners rate highly. You can recommend tracks from this list if they fit, or use them as a reference point for the calibre of music to suggest. Do NOT just copy this list — use it to understand what "quality" means in each genre, then find similar-calibre tracks the user hasn't heard.` : ""}
-
-TASK: Recommend exactly ${trackCount} tracks that this person would likely enjoy but has almost certainly NOT heard yet.
-
-CRITICAL RULES:
-- QUALITY ABOVE ALL: Every track must be genuinely great music — critically acclaimed, fan-favourite deep cuts, or boundary-pushing within its genre. Do not recommend filler, generic tracks, or safe algorithmic picks. Think "what would a knowledgeable music obsessive recommend?" not "what would an algorithm suggest."
-- NEVER recommend any artist already in their profile above
-- Popularity is irrelevant — an obscure track is fine IF it's exceptional. A popular track is fine IF it's genuinely great, not just well-known
-- Favour tracks that are interesting, surprising, or ambitious — songs that do something unexpected with production, arrangement, genre fusion, or songwriting
-- Each recommendation should be a real, specific track that exists on Spotify
-- Spread recommendations across multiple different artists (no more than 2 tracks per artist)
-- Include at least 3-4 tracks from non-English-language music
-- Include at least 2-3 tracks from before the year 2000
-- Think about what QUALITIES make their current music appealing (energy, complexity, production style, mood) and find those qualities in unexpected places
-
-Respond with ONLY a JSON array of objects, no other text. Each object should have:
-- "artist": exact artist name as it appears on Spotify
-- "track": exact track name as it appears on Spotify
-- "why": one sentence explaining the connection to their taste (this helps the user understand why they might like it)
-
-Example format:
-[{"artist": "Artist Name", "track": "Track Name", "why": "Similar driving energy to X but from the Brazilian funk scene"}]`;
+Example: {"tracks": [14, 3, 27, 8, 41, ...]}`;
 
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -1049,112 +1235,53 @@ Example format:
     },
     body: JSON.stringify({
       model: "claude-sonnet-4-6",
-      max_tokens: 16384,
+      max_tokens: 8192,
       messages: [{ role: "user", content: prompt }],
     }),
   });
 
   if (!res.ok) {
     const err = await res.text();
-    throw new Error(`Claude API failed (${res.status}): ${err}`);
+    throw new Error(`Curation API failed (${res.status}): ${err}`);
   }
 
   const data = await res.json();
   const text = data.content?.[0]?.text || "";
 
-  // Parse JSON from response (handle potential markdown fences)
-  const jsonStr = text.replace(/```json\s*|```\s*/g, "").trim();
-  let recommendations;
-  try {
-    recommendations = JSON.parse(jsonStr);
-  } catch (e) {
-    console.error("Failed to parse Claude response:", text.slice(0, 500));
-    throw new Error("Claude returned invalid JSON");
+  // Extract the JSON array from Claude's response
+  const arrayMatch = text.match(/\[\s*(?:\d+\s*,\s*)*\d+\s*\]/);
+  if (!arrayMatch) {
+    throw new Error(`Curation returned no track list. Response: ${text.slice(0, 300)}`);
   }
 
-  if (!Array.isArray(recommendations) || recommendations.length === 0) {
-    throw new Error("Claude returned empty recommendations");
+  const order = JSON.parse(arrayMatch[0]);
+  if (order.length === 0) {
+    throw new Error("Curation returned empty track list");
   }
 
-  log(`Got ${recommendations.length} recommendations`);
-  return recommendations;
-}
-
-// ---------------------------------------------------------------------------
-// Search Spotify for recommended tracks
-// ---------------------------------------------------------------------------
-
-async function resolveTracksOnSpotify(recommendations, accessToken) {
-  logStep("5b/6", "Searching Spotify for recommended tracks...");
-
-  const resolved = [];
-  const notFound = [];
-
-  for (const rec of recommendations) {
-    // Search with artist + track name
-    const query = `track:${rec.track} artist:${rec.artist}`;
-    try {
-      const results = await spotifyGet("/search", accessToken, {
-        q: query,
-        type: "track",
-        limit: 3,
-      });
-
-      const tracks = results.tracks?.items || [];
-      if (tracks.length > 0) {
-        // Find best match — prefer exact artist match
-        const match =
-          tracks.find((t) =>
-            t.artists.some((a) => a.name.toLowerCase() === rec.artist.toLowerCase())
-          ) || tracks[0];
-
-        resolved.push({
-          uri: match.uri,
-          name: match.name,
-          artist: match.artists[0]?.name,
-          why: rec.why,
-        });
-      } else {
-        // Try broader search
-        const broadResults = await spotifyGet("/search", accessToken, {
-          q: `${rec.artist} ${rec.track}`,
-          type: "track",
-          limit: 3,
-        });
-        const broadTracks = broadResults.tracks?.items || [];
-        if (broadTracks.length > 0) {
-          resolved.push({
-            uri: broadTracks[0].uri,
-            name: broadTracks[0].name,
-            artist: broadTracks[0].artists[0]?.name,
-            why: rec.why,
-          });
-        } else {
-          notFound.push(`${rec.artist} - ${rec.track}`);
-        }
-      }
-    } catch (err) {
-      notFound.push(`${rec.artist} - ${rec.track} (error: ${err.message})`);
+  // Map the ordered indices back to resolved tracks (1-indexed → 0-indexed)
+  const curated = [];
+  for (const idx of order) {
+    if (curated.length >= targetCount) break;
+    const track = resolvedTracks[idx - 1];
+    if (track && !curated.includes(track)) {
+      curated.push(track);
     }
-
-    // Small delay to avoid rate limiting
-    await new Promise((r) => setTimeout(r, 100));
   }
 
-  log(`Resolved ${resolved.length}/${recommendations.length} tracks on Spotify`);
-  if (notFound.length > 0) {
-    log(`Could not find: ${notFound.slice(0, 5).join(", ")}${notFound.length > 5 ? ` (+${notFound.length - 5} more)` : ""}`);
-  }
-
-  return resolved;
+  const result = antiCluster(curated);
+  log(`Curated ${result.length} tracks into sequenced playlist`);
+  return result;
 }
+
+// (resolveTracksOnSpotify removed — candidates come with Spotify URIs from tracklists.json)
 
 // ---------------------------------------------------------------------------
 // Create / update playlist
 // ---------------------------------------------------------------------------
 
 async function refreshPlaylist(resolvedTracks, accessToken) {
-  logStep("6/6", "Updating Discovery Engine playlist...");
+  logStep("4/4", "Updating Discovery Engine playlist...");
 
   // Get current user
   const me = await spotifyGet("/me", accessToken);
@@ -1211,54 +1338,103 @@ async function main() {
     const claudeApiKey = await getClaudeApiKey();
     const tokens = await getSpotifyTokens(config);
 
-    // 1. Gather taste profile from Spotify + Last.fm in parallel
-    const [tasteProfile, lastfmData] = await Promise.all([
+    // 1. Gather taste profile, Last.fm play counts, and tracklists in parallel
+    const [tasteProfile, lastfmData, tracklists] = await Promise.all([
       gatherTasteProfile(tokens.access_token),
       fetchLastfmUserData(),
+      loadTracklists(),
     ]);
+
+    if (Object.keys(tracklists).length === 0) {
+      console.error("\nNo tracklist data found. Run 'node fetch-tracklists.mjs' first.");
+      process.exit(1);
+    }
 
     // 2. Scan saved library for broader genre picture
     const libraryData = await scanSavedLibrary(tokens.access_token, tasteProfile);
 
-    // 3. Analyze gaps with Claude
-    const gapAnalysis = await analyzeGaps(tasteProfile, libraryData, claudeApiKey, lastfmData);
+    // 3. Find ~60 candidate tracks via Last.fm similarity, cross-referenced with best-album tracklists
+    const candidates = await findCandidates(lastfmData, tasteProfile, libraryData, tracklists, claudeApiKey, Math.round(trackCount * 1.4));
 
-    // 4. Taste interview
-    const interviewResults = await conductTasteInterview(gapAnalysis);
+    // Candidates already have Spotify URIs from tracklists — format them for curation
+    const candidateTracks = candidates.map((c) => ({
+      uri: c.uri,
+      name: c.track,
+      artist: c.artist,
+      album: c.album || null,
+      year: c.year || null,
+      matchScore: c.matchScore || 0,
+      seedInfo: c.similarTo || null,
+      why: `Similar to: ${c.similarTo} (match: ${(c.matchScore * 100).toFixed(0)}%)`,
+      similarTo: c.similarTo,
+    }));
 
-    // 4b. Fetch quality references from Last.fm for underrepresented genres
-    const gapGenres = gapAnalysis?.gaps?.map((g) => g.area) || [];
-    const allProfileGenres = tasteProfile.allGenres.slice(0, 5);
-    const genresToLookup = [...new Set([...gapGenres, ...allProfileGenres])];
-    const qualityRefs = await fetchQualityReferences(genresToLookup);
-
-    // 5. Get Claude recommendations (enhanced with interview + library data + quality refs)
-    const recommendations = await getRecommendations(tasteProfile, claudeApiKey, interviewResults, libraryData, qualityRefs, lastfmData);
-
-    // 5b. Resolve on Spotify
-    const resolvedTracks = await resolveTracksOnSpotify(recommendations, tokens.access_token);
-
-    if (resolvedTracks.length === 0) {
-      console.error("\nNo tracks could be resolved on Spotify. Try again.");
-      process.exit(1);
+    // Fetch genres from Last.fm for candidate artists
+    if (LASTFM_API_KEY) {
+      const uniqueArtists = [...new Set(candidateTracks.map((t) => t.artist))];
+      log(`Fetching genres for ${uniqueArtists.length} candidate artists...`);
+      const genreMap = new Map();
+      // Batch in groups of 5 to avoid rate limits
+      for (let i = 0; i < uniqueArtists.length; i += 5) {
+        const batch = uniqueArtists.slice(i, i + 5);
+        const results = await Promise.all(batch.map(async (artist) => {
+          try {
+            const data = await lastfmGet("artist.getTopTags", { artist, autocorrect: 1 });
+            const tags = (data?.toptags?.tag || []).slice(0, 3).map((t) => t.name.toLowerCase());
+            return { artist, tags };
+          } catch { return { artist, tags: [] }; }
+        }));
+        for (const { artist, tags } of results) {
+          if (tags.length > 0) genreMap.set(artist, tags);
+        }
+      }
+      // Attach genres to candidates
+      for (const t of candidateTracks) {
+        t.genres = genreMap.get(t.artist) || [];
+      }
+      log(`Got genres for ${genreMap.size}/${uniqueArtists.length} artists`);
     }
 
-    // 6. Update playlist
-    const { playlistId } = await refreshPlaylist(resolvedTracks, tokens.access_token);
+    log(`${candidateTracks.length} candidates ready for curation`);
+
+    // 4. Claude curates and sequences the final playlist
+    const curatedTracks = await curatePlaylist(candidateTracks, claudeApiKey, trackCount);
+
+    // 5. Update playlist
+    const { playlistId } = await refreshPlaylist(curatedTracks, tokens.access_token);
 
     // Summary
     console.log("\n╔══════════════════════════════════════════════════════════╗");
-    console.log("║                    ✓ Playlist Updated                   ║");
+    console.log("║                    Playlist Updated                     ║");
     console.log("╚══════════════════════════════════════════════════════════╝\n");
-    console.log(`  Playlist: ${PLAYLIST_NAME}`);
-    console.log(`  Tracks:   ${resolvedTracks.length}`);
+    console.log(`  Playlist:  ${PLAYLIST_NAME}`);
+    console.log(`  Tracks:    ${curatedTracks.length} (curated from ${candidateTracks.length} candidates)`);
     console.log(`  Diversity: ${diversity}`);
-    console.log(`  Open:     https://open.spotify.com/playlist/${playlistId}\n`);
+    console.log(`  Open:      https://open.spotify.com/playlist/${playlistId}\n`);
+
+    // Count unique albums and decade spread
+    const uniqueAlbums = new Set(curatedTracks.map((t) => t.album).filter(Boolean));
+    const decades = {};
+    for (const t of curatedTracks) {
+      if (t.year) {
+        const decade = `${Math.floor(t.year / 10) * 10}s`;
+        decades[decade] = (decades[decade] || 0) + 1;
+      }
+    }
+    if (uniqueAlbums.size > 0) console.log(`  Albums:    ${uniqueAlbums.size} different albums`);
+    if (Object.keys(decades).length > 0) {
+      const decadeStr = Object.entries(decades).sort((a, b) => a[0].localeCompare(b[0])).map(([d, c]) => `${d}: ${c}`).join(", ");
+      console.log(`  Decades:   ${decadeStr}`);
+    }
+    console.log("");
 
     console.log("  What's in there:\n");
-    resolvedTracks.forEach((t, i) => {
+    curatedTracks.forEach((t, i) => {
       console.log(`  ${String(i + 1).padStart(2)}. ${t.artist} — ${t.name}`);
-      console.log(`      → ${t.why}`);
+      if (t.album) {
+        console.log(`      From: ${t.album} (${t.year || "?"})`);
+      }
+      console.log(`      ${t.why}`);
     });
 
     console.log("");
