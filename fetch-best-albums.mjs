@@ -21,7 +21,7 @@ const CONFIG_DIR = join(homedir(), ".spotify-discover");
 const OUTPUT_PATH = join(CONFIG_DIR, "best-albums.json");
 const ALBUMS_PER_YEAR = 15;
 const CURRENT_YEAR = new Date().getFullYear();
-const DEFAULT_START_YEAR = CURRENT_YEAR - 49; // 50 years inclusive
+const DEFAULT_START_YEAR = 1971; // 55+ years of critically acclaimed music
 
 const FEED_URL = (year) =>
   `https://www.besteveralbums.com/feeds/BestEverAlbumsdotCom_BestAlbumsOf${year}.xml`;
