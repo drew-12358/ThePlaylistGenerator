@@ -3,7 +3,7 @@
 /**
  * Fetch Tracklists from Spotify
  *
- * Reads best-albums.json and looks up each album on Spotify to get its tracklist.
+ * Reads my-albums.json (personal album list), looks up each album on Spotify to get its tracklist.
  * Results are saved to ~/.spotify-discover/tracklists.json
  *
  * Designed to be re-run safely — skips albums already fetched.
@@ -30,7 +30,8 @@ import { join } from "node:path";
 const CONFIG_DIR = join(homedir(), ".spotify-discover");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
 const TOKEN_PATH = join(CONFIG_DIR, "tokens.json");
-const ALBUMS_PATH = join(CONFIG_DIR, "best-albums.json");
+const PROJECT_DIR = new URL(".", import.meta.url).pathname;
+const MY_ALBUMS_PATH = join(PROJECT_DIR, "my-albums.json");
 const TRACKLISTS_PATH = join(CONFIG_DIR, "tracklists.json");
 const REDIRECT_PORT = 8765;
 const REDIRECT_URI = `http://127.0.0.1:${REDIRECT_PORT}/callback`;
@@ -267,15 +268,29 @@ async function fetchAlbumTracks(album, accessToken) {
 async function main() {
   console.log("\nFetching tracklists from Spotify\n");
 
-  // Load best-albums data
-  const albumsData = await loadJson(ALBUMS_PATH);
-  if (!albumsData?.allAlbums?.length) {
-    console.error("No best-albums.json found. Run 'node fetch-best-albums.mjs' first.");
+  // Load personal album list
+  const myAlbumsData = await loadJson(MY_ALBUMS_PATH);
+
+  const allAlbums = [];
+  const seen = new Set();
+
+  if (myAlbumsData?.albums?.length) {
+    for (const a of myAlbumsData.albums) {
+      const key = `${a.artist} - ${a.album}`.toLowerCase();
+      if (!seen.has(key)) {
+        seen.add(key);
+        allAlbums.push({ ...a, source: "personal" });
+      }
+    }
+    log(`Loaded ${myAlbumsData.albums.length} albums from my-albums.json`);
+  }
+
+  if (allAlbums.length === 0) {
+    console.error("No albums found. Add albums to my-albums.json in the project directory.");
     process.exit(1);
   }
 
-  const allAlbums = albumsData.allAlbums;
-  log(`Loaded ${allAlbums.length} albums from best-albums.json`);
+  log(`Total: ${allAlbums.length} albums to process`);
 
   // Load existing tracklists (for resume support)
   let tracklists = {};
@@ -315,7 +330,7 @@ async function main() {
       if (result) {
         tracklists[key] = {
           ...result,
-          source: { artist: album.artist, album: album.album, year: album.year, rank: album.rank },
+          source: { artist: album.artist, album: album.album, year: album.year, rank: album.rank || null, origin: album.source || "unknown" },
         };
         fetched++;
         const trackCount = result.tracks.length;
