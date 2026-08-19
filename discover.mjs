@@ -134,6 +134,9 @@ const diversity = args[args.indexOf("--diversity") + 1] || "high";
 const excludeRuns = args.includes("--exclude-runs")
   ? parseInt(args[args.indexOf("--exclude-runs") + 1]) || 0
   : 3;
+const minConsumed = args.includes("--min-consumed")
+  ? parseFloat(args[args.indexOf("--min-consumed") + 1]) || 0
+  : 0;
 const modeArg = args[args.indexOf("--mode") + 1];
 const mode = (modeArg && MODE_CONFIG[modeArg]) ? modeArg : "chill";
 const MODE = MODE_CONFIG[mode];
@@ -646,6 +649,43 @@ async function buildBucketAffinity(now = new Date()) {
     affinity.set(k, (affinity.get(k) || 0) + 1);
   }
   return { currentBucket, affinity, totalInBucket, totalScrobbles: data.scrobbles.length };
+}
+
+// How much of the last playlist actually got used, so a refresh can be held
+// back until the user has worked through it.
+//
+// Spotify's API does not report skips, so "skipped" cannot be read directly.
+// It can be inferred from position: if track 40 scrobbled, tracks 1-39 were
+// played or passed over — either way the listener got that far. Shuffle breaks
+// that assumption, so distinct-tracks-played is measured too and the more
+// generous of the two wins.
+async function lastRunConsumption(runHistory) {
+  const modeRuns = (runHistory?.runs || []).filter((r) => (r.mode || "chill") === mode);
+  const last = modeRuns[modeRuns.length - 1];
+  if (!last?.tracks?.length) return null;
+
+  const runTs = last.id ? Date.parse(last.id) / 1000 : null;
+  if (!runTs || Number.isNaN(runTs)) return null;
+
+  const data = await loadJson(SCROBBLES_PATH);
+  if (!data?.scrobbles?.length) return null;
+
+  const since = new Set(
+    data.scrobbles.filter((sc) => sc.ts > runTs).map((sc) => fuzzyKey(sc.artist, sc.track))
+  );
+
+  let played = 0;
+  let reached = 0;
+  last.tracks.forEach((t, i) => {
+    if (since.has(fuzzyKey(t.artist, t.track))) {
+      played++;
+      reached = i + 1;
+    }
+  });
+
+  const total = last.tracks.length;
+  const consumed = Math.max(played, reached);
+  return { pct: consumed / total, played, reached, consumed, total, runDate: last.date };
 }
 
 // Infer dislikes without asking the user to rate anything. Spotify's API does
@@ -2530,6 +2570,27 @@ async function main() {
     if (Object.keys(tracklists).length === 0) {
       console.error(`\nNo tracklist data found for mode '${mode}'. Check ${MODE.albumsFile} and run 'node fetch-tracklists.mjs'.`);
       process.exit(1);
+    }
+
+    // Hold off refreshing until the last playlist has actually been worked
+    // through. Exits 0, not 1 — a deliberate skip is not a failure, and a
+    // scheduled run should not report red for it.
+    if (minConsumed > 0) {
+      const used = await lastRunConsumption(await loadRunHistory());
+      if (used && used.pct < minConsumed) {
+        console.log(
+          `\nSkipping refresh: ${(used.pct * 100).toFixed(0)}% of the last ${PLAYLIST_NAME} ` +
+          `playlist consumed (${used.consumed}/${used.total}), below the ${(minConsumed * 100).toFixed(0)}% threshold.`
+        );
+        console.log(`  ${used.played} tracks played, reached position ${used.reached} of ${used.total} (run of ${used.runDate}).`);
+        console.log(`  Run without --min-consumed to refresh anyway.\n`);
+        process.exit(0);
+      }
+      if (used) {
+        log(`Last playlist ${(used.pct * 100).toFixed(0)}% consumed (${used.consumed}/${used.total}) — refreshing`);
+      } else {
+        log(`No consumption data for ${mode} yet — refreshing`);
+      }
     }
 
     const feedback = await loadFeedback();

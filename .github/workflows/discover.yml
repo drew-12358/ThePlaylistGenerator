@@ -11,6 +11,10 @@ on:
         type: choice
         options: [both, chill, hard]
         default: both
+      force:
+        description: 'Refresh even if the last playlist is barely played'
+        type: boolean
+        default: false
 
 concurrency:
   # Two runs sharing one Spotify quota is what triggers throttling.
@@ -82,13 +86,16 @@ jobs:
       - name: Refresh scrobbles
         run: node fetch-scrobbles.mjs
 
+      # Only refresh a playlist once 75% of it has been listened to or skipped
+      # past. Below that the run exits 0 without touching Spotify, so a daily
+      # schedule self-throttles to the pace it actually gets played.
       - name: Refresh Discovery Chill
         if: ${{ github.event_name == 'schedule' || inputs.modes == 'both' || inputs.modes == 'chill' }}
-        run: node discover.mjs --mode chill
+        run: node discover.mjs --mode chill ${{ inputs.force && ' ' || '--min-consumed 0.75' }}
 
       - name: Refresh Discovery Heavy
         if: ${{ github.event_name == 'schedule' || inputs.modes == 'both' || inputs.modes == 'hard' }}
-        run: node discover.mjs --mode hard
+        run: node discover.mjs --mode hard ${{ inputs.force && ' ' || '--min-consumed 0.75' }}
 
       - name: Remove credentials
         if: always()
