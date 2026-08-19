@@ -100,3 +100,5 @@ jobs:
       - name: Remove credentials
         if: always()
         run: rm -f .env ~/.spotify-discover/config.json
+
+# Scheduled daily; dispatch manually with force to bypass the consumption gate.
