@@ -38,6 +38,8 @@ const TOKEN_PATH = join(CONFIG_DIR, "tokens.json");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
 const ARTIST_TAGS_CACHE_PATH = join(CONFIG_DIR, "artist-tags-cache.json");
 const ARTIST_SIMILAR_CACHE_PATH = join(CONFIG_DIR, "artist-similar-cache.json");
+const ARTIST_TOP_TRACKS_CACHE_PATH = join(CONFIG_DIR, "artist-top-tracks-cache.json");
+const TRACK_URI_CACHE_PATH = join(CONFIG_DIR, "track-uri-cache.json");
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const REDIRECT_PORT = 8765;
 const REDIRECT_URI = `http://127.0.0.1:${REDIRECT_PORT}/callback`;
@@ -63,6 +65,17 @@ const HARD_TAG_GROUPS = {
 
 // Flat set for quick membership check + reverse lookup to group name
 const HARD_TAGS = new Set(Object.values(HARD_TAG_GROUPS).flat());
+
+// Tags that settle the question on their own. A bare "metal" or "post-hardcore"
+// is ambiguous — Rage Against The Machine and Quicksand carry those and still
+// belong in chill. These do not: an artist tagged "nu metal" or "industrial
+// metal" seeds exploration straight into Heavy's territory.
+const DECISIVE_HARD_TAGS = new Set([
+  "nu metal", "nu-metal", "industrial metal", "groove metal", "heavy metal",
+  "thrash metal", "death metal", "black metal", "doom metal", "sludge metal",
+  "speed metal", "power metal", "metalcore", "deathcore", "djent", "mathcore",
+  "grindcore", "powerviolence", "industrial", "industrial rock", "ebm", "aggrotech",
+]);
 const HARD_TAG_TO_GROUP = new Map();
 for (const [group, tags] of Object.entries(HARD_TAG_GROUPS)) {
   for (const tag of tags) HARD_TAG_TO_GROUP.set(tag, group);
@@ -74,6 +87,13 @@ const MODE_CONFIG = {
     seedFile: "my-seeds.json",
     albumsFile: "my-albums.json",
     genreAllowlist: null,
+    // Heavy artists are excluded as SEEDS only — chill's output stays genre-open
+    // (pop, funk, soul all welcome), it just doesn't explore into Heavy's territory.
+    seedGenreBlocklist: HARD_TAGS,
+    // Fraction of the candidate pool the artist-discovery pass may claim before
+    // track.getSimilar runs. Chill is the exploration mode — wide swings across
+    // the whole collection are wanted, including pop the seeds don't predict.
+    artistDiscoveryBudget: 0.75,
     decadeTargets: { "70s": 0.08, "80s": 0.20, "90s": 0.20, "00s": 0.20, "10s": 0.20, "20s": 0.12 },
     description: "Fresh discoveries, curated by AI.",
     tagline: "a diverse music collection, not a genre playlist",
@@ -83,6 +103,9 @@ const MODE_CONFIG = {
     seedFile: "my-seeds-hard.json",
     albumsFile: "my-albums.json",
     genreAllowlist: HARD_TAGS,
+    // Hard mode leans entirely on artist discovery — the genre allowlist needs a
+    // deep pool to filter against, and this is what already made it work.
+    artistDiscoveryBudget: 1.0,
     decadeTargets: { "70s": 0, "80s": 0.05, "90s": 0.25, "00s": 0.25, "10s": 0.25, "20s": 0.20 },
     description: "Heavy cuts — DnB, metal, industrial, hardcore.",
     tagline: "heavy music only — DnB, metal, industrial, hardcore. Reject anything that doesn't hit hard",
@@ -198,9 +221,25 @@ async function lastfmGet(method, params = {}) {
   url.searchParams.set("format", "json");
   Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
 
-  const res = await fetch(url.toString());
-  if (!res.ok) return null;
-  return res.json();
+  // These calls run in long serial loops. Without a timeout a single stalled
+  // connection blocks the whole pipeline indefinitely, so bound each attempt
+  // and retry once rather than hanging forever.
+  const attempt = async () => {
+    const res = await fetch(url.toString(), { signal: AbortSignal.timeout(15000) });
+    if (!res.ok) return null;
+    return res.json();
+  };
+
+  try {
+    return await attempt();
+  } catch {
+    try {
+      return await attempt();
+    } catch {
+      log(`  Last.fm ${method} timed out, skipping`);
+      return null;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -379,6 +418,109 @@ async function saveArtistSimilarCache() {
   } catch { /* non-fatal */ }
 }
 
+// Artist top-tracks cache. Drives both deep-cut selection and signature-hit
+// rejection, so it is hit constantly — without a disk cache every run re-fetches
+// the lot, which is minutes of serial Last.fm calls.
+const artistTopTracksCache = new Map(); // key → string[]
+let _artistTopTracksDiskCache = {};
+
+async function loadArtistTopTracksCache() {
+  try {
+    _artistTopTracksDiskCache = JSON.parse(await readFile(ARTIST_TOP_TRACKS_CACHE_PATH, "utf8"));
+    const now = Date.now();
+    let loaded = 0;
+    for (const [k, v] of Object.entries(_artistTopTracksDiskCache)) {
+      if (v.fetchedAt && now - v.fetchedAt < CACHE_TTL_MS) {
+        artistTopTracksCache.set(k, v.tracks);
+        loaded++;
+      }
+    }
+    if (loaded > 0) log(`Loaded ${loaded} artist top-tracks from disk cache`);
+  } catch {
+    _artistTopTracksDiskCache = {};
+  }
+}
+
+async function saveArtistTopTracksCache() {
+  for (const [k, tracks] of artistTopTracksCache.entries()) {
+    if (!_artistTopTracksDiskCache[k] || !_artistTopTracksDiskCache[k].fetchedAt) {
+      _artistTopTracksDiskCache[k] = { tracks, fetchedAt: Date.now() };
+    }
+  }
+  try {
+    await writeFile(ARTIST_TOP_TRACKS_CACHE_PATH, JSON.stringify(_artistTopTracksDiskCache), "utf8");
+  } catch { /* non-fatal */ }
+}
+
+async function getArtistTopTrackNames(artistName) {
+  const key = artistName.toLowerCase();
+  if (artistTopTracksCache.has(key)) return artistTopTracksCache.get(key);
+  let list = [];
+  try {
+    const res = await lastfmGet("artist.getTopTracks", { artist: artistName, limit: 50 });
+    list = (res?.toptracks?.track || []).map((t) => t.name);
+  } catch {
+    list = [];
+  }
+  artistTopTracksCache.set(key, list);
+  return list;
+}
+
+// ---------------------------------------------------------------------------
+// Track URI cache — artist+track → Spotify URI.
+//
+// Resolving Last.fm candidates to URIs costs one /search call each, and the same
+// tracks recur across runs. Without this, a run burns ~85 searches re-resolving
+// what it already knew, which is what triggers Spotify's rate limiter.
+//
+// No TTL: a track's URI never changes, so entries are valid indefinitely.
+// ---------------------------------------------------------------------------
+
+const trackUriCache = new Map(); // fuzzyKey → { uri, name, artist, album, year, popularity }
+
+async function loadTrackUriCache() {
+  try {
+    const raw = JSON.parse(await readFile(TRACK_URI_CACHE_PATH, "utf8"));
+    for (const [k, v] of Object.entries(raw)) trackUriCache.set(k, v);
+    log(`Loaded ${trackUriCache.size} track URIs from disk cache`);
+  } catch {
+    // no cache yet
+  }
+
+  // Seed from tracklists.json — already holds full Spotify tracklists with URIs
+  // for every album in the collection, so the cache starts warm instead of empty.
+  let seeded = 0;
+  try {
+    const data = JSON.parse(await readFile(join(CONFIG_DIR, "tracklists.json"), "utf8"));
+    for (const album of Object.values(data.albums || {})) {
+      const year = album.releaseDate ? parseInt(album.releaseDate.slice(0, 4)) : null;
+      for (const t of album.tracks || []) {
+        if (!t.uri || !t.artist || !t.name) continue;
+        const k = fuzzyKey(t.artist, t.name);
+        if (trackUriCache.has(k)) continue;
+        trackUriCache.set(k, {
+          uri: t.uri,
+          name: t.name,
+          artist: t.artist,
+          album: album.spotifyName || null,
+          year,
+          popularity: null, // album endpoint returns simplified tracks
+        });
+        seeded++;
+      }
+    }
+  } catch {
+    // no tracklists file — cache just starts colder
+  }
+  if (seeded > 0) log(`Pre-populated ${seeded} track URIs from tracklists.json`);
+}
+
+async function saveTrackUriCache() {
+  try {
+    await writeFile(TRACK_URI_CACHE_PATH, JSON.stringify(Object.fromEntries(trackUriCache)), "utf8");
+  } catch { /* non-fatal */ }
+}
+
 async function getArtistSimilar(artistName, limit = 15) {
   const key = artistName.toLowerCase();
   if (artistSimilarCache.has(key)) return artistSimilarCache.get(key);
@@ -504,6 +646,41 @@ async function buildBucketAffinity(now = new Date()) {
     affinity.set(k, (affinity.get(k) || 0) + 1);
   }
   return { currentBucket, affinity, totalInBucket, totalScrobbles: data.scrobbles.length };
+}
+
+// Infer dislikes without asking the user to rate anything. Spotify's API does
+// not expose skips, but a track that was served in a past playlist and never
+// once appears in the scrobble history was never played through. Requires the
+// track to have been offered `minRuns` times before counting it as a dislike,
+// so a single unlucky run (playlist never played at all) doesn't poison it.
+async function inferSkippedTracks(runHistory, minRuns = 2) {
+  const data = await loadJson(SCROBBLES_PATH);
+  if (!data?.scrobbles?.length) return { keys: new Set(), offeredCounts: new Map(), labels: new Map() };
+
+  const scrobbled = new Set(data.scrobbles.map((s) => fuzzyKey(s.artist, s.track)));
+
+  // Only consider runs old enough to have been listened to, and only this mode.
+  const modeRuns = (runHistory?.runs || []).filter((r) => (r.mode || "chill") === mode);
+
+  const offeredCounts = new Map();
+  const labels = new Map();
+  for (const run of modeRuns) {
+    // A run's tracks can only count as "not played" if scrobbles exist after it.
+    const runTs = run.timestamp ? Date.parse(run.timestamp) / 1000 : null;
+    if (runTs && data.lastFetchedTs && data.lastFetchedTs <= runTs) continue;
+
+    for (const t of run.tracks || []) {
+      const k = fuzzyKey(t.artist, t.track);
+      offeredCounts.set(k, (offeredCounts.get(k) || 0) + 1);
+      if (!labels.has(k)) labels.set(k, `${t.artist} — ${t.track}`);
+    }
+  }
+
+  const keys = new Set();
+  for (const [k, n] of offeredCounts) {
+    if (n >= minRuns && !scrobbled.has(k)) keys.add(k);
+  }
+  return { keys, offeredCounts, labels };
 }
 
 // ---------------------------------------------------------------------------
@@ -701,6 +878,36 @@ async function findSeeds(accessToken, tracklists, lastfmData, feedback, bucketIn
 
   log(`Total seeds: ${seeds.length} (${historySeeds} history/favourites + ${seeds.length - historySeeds} all-time albums)`);
 
+  // Drop seeds belonging to the other mode's territory. Chill's album list holds
+  // plenty of heavy artists, and artist.getSimilar on those walks straight into
+  // nu-metal and industrial — material that belongs in Heavy, not here. Filtering
+  // at the seed stage stops the exploration heading that way at all, rather than
+  // generating those candidates and discarding them afterwards.
+  if (MODE.seedGenreBlocklist) {
+    const seedArtists = [...new Set(seeds.map((s) => s.artist))];
+    await fetchArtistTagsBatch(seedArtists);
+
+    const blocked = [];
+    const kept = seeds.filter((s) => {
+      const tags = artistTagCache.get(s.artist.toLowerCase()) || [];
+      // Either one unambiguous heavy tag, or two distinct heavy groups — so a
+      // lone "metal" on an otherwise non-heavy artist doesn't disqualify them.
+      const decisive = tags.some((t) => DECISIVE_HARD_TAGS.has(t));
+      if (decisive || tagsMatchAllowlist(tags, MODE.seedGenreBlocklist, 2)) {
+        blocked.push(s.artist);
+        return false;
+      }
+      return true;
+    });
+
+    if (blocked.length > 0) {
+      const names = [...new Set(blocked)];
+      log(`Dropped ${blocked.length} heavy seeds from ${mode}: ${names.slice(0, 8).join(", ")}${names.length > 8 ? `, +${names.length - 8} more` : ""}`);
+      seeds.length = 0;
+      seeds.push(...kept);
+    }
+  }
+
   // Tag every seed with bucketAffinity (scrobble count in current time bucket)
   if (bucketInfo?.affinity) {
     for (const s of seeds) {
@@ -817,6 +1024,63 @@ async function findCandidates(seeds, recentlyPlayed, accessToken, targetCount = 
   const candidates = [];
   const seenTracks = new Set();
   const seenArtists = new Map();
+
+  // Artists the user demonstrably already likes — from their own album list and
+  // from anything they've actually scrobbled. For these, the obvious hit is the
+  // last thing they want ("I really like Rage Against The Machine, but I've
+  // heard Killing In The Name 100,000 times"). Deeper catalogue cuts instead.
+  const familiarArtists = new Set();
+  for (const a of lastfmData?.artists || []) {
+    if ((a.playCount || 0) > 0) familiarArtists.add(a.name.toLowerCase());
+  }
+  try {
+    const projectDir = new URL(".", import.meta.url).pathname;
+    const myData = JSON.parse(await readFile(join(projectDir, MODE.albumsFile), "utf8"));
+    for (const al of myData.albums || []) familiarArtists.add(al.artist.toLowerCase());
+  } catch {
+    // no album list — fall back to scrobble data alone
+  }
+
+  // The album list plus a 5-month Last.fm history misses decades of listening,
+  // which mislabels long-known artists as new and serves them their biggest hit.
+  // The Spotify library covers that gap: follows, saved albums, liked tracks and
+  // top artists on long_term all mean "already known".
+  {
+    const before = familiarArtists.size;
+    const addArtists = (arr) => {
+      for (const a of arr || []) if (a?.name) familiarArtists.add(a.name.toLowerCase());
+    };
+    const results = await Promise.all([
+      spotifyGet("/me/following", accessToken, { type: "artist", limit: 50 }).catch(() => null),
+      spotifyGet("/me/albums", accessToken, { limit: 50 }).catch(() => null),
+      spotifyGet("/me/tracks", accessToken, { limit: 50 }).catch(() => null),
+      ...["long_term", "medium_term", "short_term"].map((r) =>
+        spotifyGet("/me/top/artists", accessToken, { time_range: r, limit: 50 }).catch(() => null)
+      ),
+    ]);
+
+    const [following, albums, tracks, ...topArtistPages] = results;
+    addArtists(following?.artists?.items);
+    for (const it of albums?.items || []) addArtists(it.album?.artists);
+    for (const it of tracks?.items || []) addArtists(it.track?.artists);
+    for (const page of topArtistPages) addArtists(page?.items);
+
+    log(`Familiar artists: +${familiarArtists.size - before} from Spotify library`);
+  }
+
+  log(`Familiar artists (deep cuts only): ${familiarArtists.size}`);
+
+  const getTopTracksFor = getArtistTopTrackNames;
+
+  // How many of a familiar artist's biggest tracks to treat as burned-in.
+  const HIT_DEPTH = 5;
+  async function isSignatureHit(artistName, trackName) {
+    if (!familiarArtists.has(artistName.toLowerCase())) return false;
+    const top = await getTopTracksFor(artistName);
+    if (top.length === 0) return false;
+    const key = fuzzyKey(artistName, trackName);
+    return top.slice(0, HIT_DEPTH).some((n) => fuzzyKey(artistName, n) === key);
+  }
   let apiCalls = 0;
 
   // Build seed track set so we never recommend a seed track back
@@ -845,84 +1109,142 @@ async function findCandidates(seeds, recentlyPlayed, accessToken, targetCount = 
     log(`Excluding ${feedback.skipped.length} feedback-skipped tracks`);
   }
 
-  // Exclude only HEAVILY-played tracks from Last.fm — burned-in stuff with
-  // 50+ scrobbles is what we want to keep out. Tracks the user has heard
-  // a few times are welcome back (the "hey you might like this" feel).
-  const HEAVY_PLAY_THRESHOLD = 50;
-  if (lastfmData?.tracks?.length > 0) {
-    let overplayedCount = 0;
-    for (const t of lastfmData.tracks) {
-      if ((t.playCount || 0) < HEAVY_PLAY_THRESHOLD) continue;
-      const key = fuzzyKey(t.artist, t.name);
-      if (!excludeKeys.has(key)) {
-        excludeKeys.add(key);
-        overplayedCount++;
-      }
+  // Inferred dislikes — served two or more times, never scrobbled once.
+  // This is the automatic equivalent of --skip: no rating required from the user.
+  {
+    const runHistory = await loadRunHistory();
+    const inferred = await inferSkippedTracks(runHistory, 2);
+    let added = 0;
+    for (const k of inferred.keys) {
+      if (!excludeKeys.has(k)) { excludeKeys.add(k); added++; }
     }
-    if (overplayedCount > 0) log(`Excluding ${overplayedCount} heavily-played tracks (Last.fm plays >= ${HEAVY_PLAY_THRESHOLD})`);
+    if (inferred.keys.size > 0) {
+      const sample = [...inferred.keys].slice(0, 5).map((k) => inferred.labels.get(k) || k);
+      log(`Excluding ${inferred.keys.size} inferred dislikes (offered 2+ times, never played): ${sample.join("; ")}${inferred.keys.size > 5 ? "; …" : ""}`);
+    }
+  }
+
+  // Exclude heavily-played tracks. The threshold is relative to this account's
+  // actual scrobble depth — a fixed 50 excluded nothing, because the most-played
+  // track here has ~11 plays. Anything in the top slice of play counts is
+  // burned-in for this listener regardless of the absolute number.
+  if (lastfmData?.tracks?.length > 0) {
+    const counts = lastfmData.tracks
+      .map((t) => t.playCount || 0)
+      .filter((n) => n > 0)
+      .sort((a, b) => b - a);
+
+    if (counts.length > 0) {
+      // Top 10% of play counts, floored at 3 so a thin history can't exclude
+      // everything it has ever seen twice.
+      const cutIdx = Math.floor(counts.length * 0.1);
+      const threshold = Math.max(3, counts[cutIdx] ?? 3);
+
+      let overplayedCount = 0;
+      for (const t of lastfmData.tracks) {
+        if ((t.playCount || 0) < threshold) continue;
+        const key = fuzzyKey(t.artist, t.name);
+        if (!excludeKeys.has(key)) {
+          excludeKeys.add(key);
+          overplayedCount++;
+        }
+      }
+      log(`Excluding ${overplayedCount} heavily-played tracks (Last.fm plays >= ${threshold}, adaptive)`);
+    }
   }
 
   log(`Total exclusion set: ${excludeKeys.size} tracks`);
 
   log(`Weighted per-seed slots: base ${baseSeed} (discovery-weighted: low-play seeds +2, high-play seeds -1)`);
 
-  // Pass 0 (hard mode only): artist.getSimilar → artist.getTopTracks
-  // Seeds are known heavy artists → similar artists will naturally be heavy too.
-  // Runs across all unique seed artists before track.getSimilar so the candidate pool
-  // is built from discovered artists rather than track-level similarity noise.
-  if (MODE.genreAllowlist) {
+  // Pass 0: artist.getSimilar → artist.getTopTracks.
+  // Reaches artists the user does not own at all, rather than track.getSimilar's
+  // popularity-biased "you liked Man in the Box, here's Black". Runs before
+  // track.getSimilar so the pool leads with discovered artists.
+  //
+  // `artistDiscoveryBudget` caps how much of the pool this pass may claim.
+  // Hard mode takes the whole thing (its genre allowlist needs the depth);
+  // chill blends, so track-level similarity still contributes.
+  if (MODE.artistDiscoveryBudget > 0) {
+    const artistPassCap = Math.round(targetCount * MODE.artistDiscoveryBudget);
     const uniqueSeedArtists = [...new Set(seeds.map((s) => s.artist))];
     const seenSimilarArtists = new Set();
     log(`  Artist-discovery pass: ${uniqueSeedArtists.length} unique seed artists...`);
 
+    // Fetch every seed artist's related list up front, then round-robin across
+    // them. Draining one seed artist at a time let the first few eat the whole
+    // budget, so the pool inherited a single genre. Lapping across all of them
+    // spreads discovery over the user's full taste instead.
+    const relatedBySeed = new Map();
     for (const seedArtist of uniqueSeedArtists) {
       try {
         const cached = artistSimilarCache.has(seedArtist.toLowerCase());
-        const related = await getArtistSimilar(seedArtist, 15);
+        const related = await getArtistSimilar(seedArtist, 30);
         if (!cached) { apiCalls++; await new Promise((r) => setTimeout(r, 200)); }
-
-        for (const ra of related.slice(0, 12)) {
-          const artistLower = ra.name.toLowerCase();
-          if (artistLower === seedArtist.toLowerCase()) continue;
-          if (seenSimilarArtists.has(artistLower)) continue;
-          if ((seenArtists.get(resolveArtistAlias(artistLower)) || 0) >= MAX_PER_ARTIST) continue;
-
-          seenSimilarArtists.add(artistLower);
-
-          const topT = await lastfmGet("artist.getTopTracks", { artist: ra.name, limit: 8 });
-          apiCalls++;
-
-          let added = 0;
-          for (const t of topT?.toptracks?.track || []) {
-            if (added >= 3) break;
-            const key = `${ra.name} - ${t.name}`.toLowerCase();
-            const normalizedKey = fuzzyKey(ra.name, t.name);
-
-            if (seedTrackKeys.has(normalizedKey)) continue;
-            if (excludeKeys.has(normalizedKey)) continue;
-            if (seenTracks.has(key)) continue;
-            if (recentlyPlayed.has(key)) continue;
-            if ((seenArtists.get(resolveArtistAlias(artistLower)) || 0) >= MAX_PER_ARTIST) continue;
-
-            seenTracks.add(key);
-            seenArtists.set(resolveArtistAlias(artistLower), (seenArtists.get(resolveArtistAlias(artistLower)) || 0) + 1);
-            candidates.push({
-              artist: ra.name,
-              track: t.name,
-              similarTo: `${seedArtist} (artist-similar)`,
-              matchScore: parseFloat(ra.match) || 0.3,
-              seedSource: seeds.find((s) => s.artist === seedArtist)?.source || "artist-similar",
-            });
-            added++;
-          }
-          await new Promise((r) => setTimeout(r, 150));
-        }
+        if (related?.length) relatedBySeed.set(seedArtist, related);
       } catch {
         // skip failed lookups
       }
     }
+
+    // Lap N takes each seed artist's Nth-most-similar artist. Later laps sit
+    // further from the centre of the user's taste, so breadth grows with depth.
+    const maxLaps = 12;
+    outer:
+    for (let lap = 0; lap < maxLaps; lap++) {
+      for (const [seedArtist, related] of relatedBySeed) {
+        if (candidates.length >= artistPassCap) break outer;
+
+        const ra = related[lap];
+        if (!ra) continue;
+
+        const artistLower = ra.name.toLowerCase();
+        if (artistLower === seedArtist.toLowerCase()) continue;
+        if (seenSimilarArtists.has(artistLower)) continue;
+        if ((seenArtists.get(resolveArtistAlias(artistLower)) || 0) >= MAX_PER_ARTIST) continue;
+
+        seenSimilarArtists.add(artistLower);
+
+        const allTop = await getTopTracksFor(ra.name);
+        apiCalls++;
+        if (allTop.length === 0) continue;
+
+        // Familiar artist → skip their signature tracks and draw from the
+        // catalogue behind them. Unfamiliar artist → lead with what they're
+        // known for, which is the right introduction.
+        const familiar = familiarArtists.has(artistLower);
+        const pickFrom = familiar ? allTop.slice(HIT_DEPTH, HIT_DEPTH + 15) : allTop.slice(0, 8);
+        if (pickFrom.length === 0) continue;
+
+        let added = 0;
+        for (const name of pickFrom) {
+          if (added >= 2) break;
+          const key = `${ra.name} - ${name}`.toLowerCase();
+          const normalizedKey = fuzzyKey(ra.name, name);
+
+          if (seedTrackKeys.has(normalizedKey)) continue;
+          if (excludeKeys.has(normalizedKey)) continue;
+          if (seenTracks.has(key)) continue;
+          if (recentlyPlayed.has(key)) continue;
+          if ((seenArtists.get(resolveArtistAlias(artistLower)) || 0) >= MAX_PER_ARTIST) continue;
+
+          seenTracks.add(key);
+          seenArtists.set(resolveArtistAlias(artistLower), (seenArtists.get(resolveArtistAlias(artistLower)) || 0) + 1);
+          candidates.push({
+            artist: ra.name,
+            track: name,
+            similarTo: `${seedArtist} (artist-similar, lap ${lap + 1}${familiar ? ", deep cut" : ""})`,
+            matchScore: parseFloat(ra.match) || 0.3,
+            seedSource: seeds.find((s) => s.artist === seedArtist)?.source || "artist-similar",
+          });
+          added++;
+        }
+        await new Promise((r) => setTimeout(r, 150));
+      }
+    }
     log(`  Artist-discovery pass: ${candidates.length} candidates so far (${seenSimilarArtists.size} similar artists explored)`);
     await saveArtistSimilarCache();
+    await saveArtistTopTracksCache();
   }
 
   // First pass: query all seeds via track.getSimilar
@@ -962,6 +1284,8 @@ async function findCandidates(seeds, recentlyPlayed, accessToken, targetCount = 
         if (seenTracks.has(key)) continue;
         if (recentlyPlayed.has(key)) continue;
         if ((seenArtists.get(resolveArtistAlias(artistLower)) || 0) >= MAX_PER_ARTIST) continue;
+        // An artist the user already likes, offering the track they've worn out
+        if (await isSignatureHit(simArtist, simTrack)) continue;
 
         seenTracks.add(key);
         seenArtists.set(resolveArtistAlias(artistLower), (seenArtists.get(resolveArtistAlias(artistLower)) || 0) + 1);
@@ -1137,6 +1461,9 @@ async function findCandidates(seeds, recentlyPlayed, accessToken, targetCount = 
   const resolved = [];
   const resolvedUris = new Set(); // dedup by Spotify URI
   let notFound = 0;
+  let cacheHits = 0;
+  let searched = 0;
+  let rateLimited = 0;
 
   for (const c of candidates) {
     // Spotify recs candidates already have a URI — skip search
@@ -1159,6 +1486,28 @@ async function findCandidates(seeds, recentlyPlayed, accessToken, targetCount = 
       continue;
     }
 
+    const cacheKey = fuzzyKey(c.artist, c.track);
+    const hit = trackUriCache.get(cacheKey);
+    if (hit) {
+      cacheHits++;
+      if (resolvedUris.has(hit.uri)) continue;
+      resolvedUris.add(hit.uri);
+      resolved.push({
+        uri: hit.uri,
+        name: hit.name,
+        artist: hit.artist,
+        album: hit.album,
+        year: hit.year,
+        similarTo: c.similarTo,
+        matchScore: c.matchScore,
+        seedSource: c.seedSource,
+        genres: c.genres || [],
+        popularity: hit.popularity ?? null,
+        why: `Similar to: ${c.similarTo} (match: ${(c.matchScore * 100).toFixed(0)}%)`,
+      });
+      continue;
+    }
+
     const query = `track:${c.track} artist:${c.artist}`;
     try {
       const results = await spotifyGet("/search", accessToken, {
@@ -1166,6 +1515,7 @@ async function findCandidates(seeds, recentlyPlayed, accessToken, targetCount = 
         type: "track",
         limit: 3,
       });
+      searched++;
 
       const tracks = results.tracks?.items || [];
       if (tracks.length > 0) {
@@ -1173,34 +1523,57 @@ async function findCandidates(seeds, recentlyPlayed, accessToken, targetCount = 
           t.artists.some((a) => a.name.toLowerCase() === c.artist.toLowerCase())
         ) || tracks[0];
 
-        // Dedup by URI — same track can appear from different seeds
-        if (resolvedUris.has(match.uri)) continue;
-        resolvedUris.add(match.uri);
-
-        resolved.push({
+        const entry = {
           uri: match.uri,
           name: match.name,
           artist: match.artists[0]?.name,
           album: match.album?.name || null,
           year: match.album?.release_date ? parseInt(match.album.release_date.slice(0, 4)) : null,
+          popularity: match.popularity ?? null,
+        };
+        trackUriCache.set(cacheKey, entry);
+
+        // Dedup by URI — same track can appear from different seeds
+        if (resolvedUris.has(match.uri)) continue;
+        resolvedUris.add(match.uri);
+
+        resolved.push({
+          ...entry,
           similarTo: c.similarTo,
           matchScore: c.matchScore,
           seedSource: c.seedSource,
           genres: c.genres || [],
-          popularity: match.popularity ?? null,
           why: `Similar to: ${c.similarTo} (match: ${(c.matchScore * 100).toFixed(0)}%)`,
         });
       } else {
         notFound++;
       }
-    } catch {
-      notFound++;
+    } catch (err) {
+      // A throttled search is not "this track doesn't exist". Swallowing the
+      // difference produced a run that resolved 0/84 and only failed later, at
+      // curation, with a misleading error.
+      if (/rate limit/i.test(err.message)) {
+        rateLimited++;
+        if (rateLimited >= 5) {
+          await saveTrackUriCache();
+          throw new Error(
+            `Spotify is rate limiting: ${rateLimited} searches refused, ${resolved.length}/${candidates.length} resolved. ` +
+            `Cached what resolved — re-run later and it will pick up from the cache.`
+          );
+        }
+      } else {
+        notFound++;
+      }
     }
 
     await new Promise((r) => setTimeout(r, 100));
   }
 
-  log(`Resolved ${resolved.length}/${candidates.length} on Spotify (${notFound} not found)`);
+  await saveTrackUriCache();
+  log(`Resolved ${resolved.length}/${candidates.length} on Spotify (${cacheHits} from cache, ${searched} searched, ${notFound} not found)`);
+  // Signature-hit checks run after the artist pass saved, so persist again to
+  // capture everything this run learned.
+  await saveArtistTopTracksCache();
   return resolved;
 }
 
@@ -1441,7 +1814,10 @@ async function spotifyGet(endpoint, accessToken, params = {}, _retries = 0) {
 
   if (res.status === 429) {
     if (_retries >= 5) throw new Error(`Spotify rate limit on ${endpoint} after ${_retries} retries`);
-    const retryAfter = Math.min(parseInt(res.headers.get("retry-after") || "2"), 30);
+    // Honour what Spotify actually asks for. Capping at 30s meant retrying long
+    // before the window cleared, which extends the throttle instead of riding it
+    // out. Only cap high enough to avoid an unbounded stall.
+    const retryAfter = Math.min(parseInt(res.headers.get("retry-after") || "2"), 300);
     log(`Rate limited, waiting ${retryAfter}s... (attempt ${_retries + 1}/5)`);
     await new Promise((r) => setTimeout(r, retryAfter * 1000));
     return spotifyGet(endpoint, accessToken, params, _retries + 1);
@@ -2147,7 +2523,7 @@ async function main() {
     await applyRatingFlags(runHistoryEarly);
 
     // 0c. Load disk caches (artist tags + similar artists)
-    await Promise.all([loadArtistTagCache(), loadArtistSimilarCache()]);
+    await Promise.all([loadArtistTagCache(), loadArtistSimilarCache(), loadArtistTopTracksCache(), loadTrackUriCache()]);
 
     // 1. Find seeds: recent listening that matches your album collection
     const tracklists = await loadTracklists();
@@ -2216,6 +2592,9 @@ async function main() {
         year: t.year,
         seed: t.similarTo,
         matchScore: t.matchScore,
+        // Recorded so run history can rebuild the URI cache if it is ever lost.
+        uri: t.uri,
+        popularity: t.popularity ?? null,
       })),
     });
     // Keep last 20 runs

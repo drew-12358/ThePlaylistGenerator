@@ -1,19 +1,73 @@
 {
   "description": "Emerging favourites — tracks getting full plays, not skipped. Supplements album collection as seed source.",
   "tracks": [
-    { "artist": "Kali Uchis", "track": "Dead To Me" },
-    { "artist": "Kanye West", "track": "Jail" },
-    { "artist": "Chappell Roan", "track": "HOT TO GO!" },
-    { "artist": "Chappell Roan", "track": "Good Luck, Babe!" },
-    { "artist": "One Day As A Lion", "track": "Wild International" },
-    { "artist": "Wet Leg", "track": "catch these fists" },
-    { "artist": "Wet Leg", "track": "CPR" },
-    { "artist": "Wet Leg", "track": "Mangetout" },
-    { "artist": "SAULT", "track": "Wildfires" },
-    { "artist": "Amyl and The Sniffers", "track": "U Should Not Be Doing That" },
-    { "artist": "Amyl and The Sniffers", "track": "Tiny Bikini" },
-    { "artist": "Amyl and The Sniffers", "track": "Hertz" },
-    { "artist": "Amyl and The Sniffers", "track": "Big Dreams" },
-    { "artist": "Fiona Apple", "track": "Drumset" }
+    {
+      "artist": "Kali Uchis",
+      "track": "Dead To Me"
+    },
+    {
+      "artist": "Kanye West",
+      "track": "Jail"
+    },
+    {
+      "artist": "Chappell Roan",
+      "track": "HOT TO GO!"
+    },
+    {
+      "artist": "Chappell Roan",
+      "track": "Good Luck, Babe!"
+    },
+    {
+      "artist": "One Day As A Lion",
+      "track": "Wild International"
+    },
+    {
+      "artist": "Wet Leg",
+      "track": "catch these fists"
+    },
+    {
+      "artist": "Wet Leg",
+      "track": "CPR"
+    },
+    {
+      "artist": "Wet Leg",
+      "track": "Mangetout"
+    },
+    {
+      "artist": "SAULT",
+      "track": "Wildfires"
+    },
+    {
+      "artist": "Amyl and The Sniffers",
+      "track": "U Should Not Be Doing That"
+    },
+    {
+      "artist": "Amyl and The Sniffers",
+      "track": "Tiny Bikini"
+    },
+    {
+      "artist": "Amyl and The Sniffers",
+      "track": "Hertz"
+    },
+    {
+      "artist": "Amyl and The Sniffers",
+      "track": "Big Dreams"
+    },
+    {
+      "artist": "Fiona Apple",
+      "track": "Drumset"
+    },
+    {
+      "artist": "Vulfpeck",
+      "track": "Dean Town"
+    },
+    {
+      "artist": "Vulfpeck",
+      "track": "Back Pocket"
+    },
+    {
+      "artist": "Vulfpeck",
+      "track": "Wait for the Moment"
+    }
   ]
 }

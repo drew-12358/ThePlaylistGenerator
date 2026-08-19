@@ -1,0 +1,95 @@
+name: Refresh Discovery Playlists
+
+on:
+  schedule:
+    # 07:00 UTC daily. GitHub's scheduler is best-effort and can lag under load.
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+    inputs:
+      modes:
+        description: 'Which playlists to refresh'
+        type: choice
+        options: [both, chill, hard]
+        default: both
+
+concurrency:
+  # Two runs sharing one Spotify quota is what triggers throttling.
+  group: discovery-engine
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - run: npm ci --omit=dev || npm install --omit=dev
+
+      # The engine's disk caches live here: track URIs, artist tags, similar
+      # artists, top tracks, scrobbles, run history, and the refreshed Spotify
+      # token. Without them every run re-fetches everything and gets throttled.
+      # run_id in the key makes each run save a new entry; restore-keys pulls
+      # the most recent one back.
+      - name: Restore engine caches
+        uses: actions/cache@v4
+        with:
+          path: ~/.spotify-discover
+          key: spotify-discover-${{ github.run_id }}
+          restore-keys: |
+            spotify-discover-
+
+      - name: Write credentials
+        env:
+          SPOTIFY_CONFIG: ${{ secrets.SPOTIFY_CONFIG }}
+          SPOTIFY_TOKENS: ${{ secrets.SPOTIFY_TOKENS }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
+          LASTFM_USER: ${{ secrets.LASTFM_USER }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.spotify-discover
+          printf '%s' "$SPOTIFY_CONFIG" > ~/.spotify-discover/config.json
+          # Only seed tokens if the cache didn't already carry a fresher set —
+          # the engine rewrites tokens.json on refresh and the cache preserves it.
+          if [ ! -s ~/.spotify-discover/tokens.json ]; then
+            printf '%s' "$SPOTIFY_TOKENS" > ~/.spotify-discover/tokens.json
+            echo "Seeded tokens.json from secret"
+          else
+            echo "Using cached tokens.json"
+          fi
+          {
+            echo "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY"
+            echo "LASTFM_API_KEY=$LASTFM_API_KEY"
+            echo "LASTFM_USER=$LASTFM_USER"
+          } > .env
+
+      # tracklists.json is required — discover.mjs exits if it's empty. If the
+      # cache missed, rebuild it from my-albums.json rather than failing.
+      - name: Ensure tracklists
+        run: |
+          set -euo pipefail
+          if [ ! -s ~/.spotify-discover/tracklists.json ]; then
+            echo "tracklists.json missing — rebuilding from my-albums.json"
+            node fetch-tracklists.mjs
+          fi
+
+      - name: Refresh scrobbles
+        run: node fetch-scrobbles.mjs
+
+      - name: Refresh Discovery Chill
+        if: ${{ github.event_name == 'schedule' || inputs.modes == 'both' || inputs.modes == 'chill' }}
+        run: node discover.mjs --mode chill
+
+      - name: Refresh Discovery Heavy
+        if: ${{ github.event_name == 'schedule' || inputs.modes == 'both' || inputs.modes == 'hard' }}
+        run: node discover.mjs --mode hard
+
+      - name: Remove credentials
+        if: always()
+        run: rm -f .env ~/.spotify-discover/config.json
