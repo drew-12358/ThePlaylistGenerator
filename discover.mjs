@@ -40,6 +40,7 @@ const ARTIST_TAGS_CACHE_PATH = join(CONFIG_DIR, "artist-tags-cache.json");
 const ARTIST_SIMILAR_CACHE_PATH = join(CONFIG_DIR, "artist-similar-cache.json");
 const ARTIST_TOP_TRACKS_CACHE_PATH = join(CONFIG_DIR, "artist-top-tracks-cache.json");
 const TRACK_URI_CACHE_PATH = join(CONFIG_DIR, "track-uri-cache.json");
+const SKIPS_PATH = join(CONFIG_DIR, "skips.json");
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const REDIRECT_PORT = 8765;
 const REDIRECT_URI = `http://127.0.0.1:${REDIRECT_PORT}/callback`;
@@ -674,18 +675,26 @@ async function lastRunConsumption(runHistory) {
     data.scrobbles.filter((sc) => sc.ts > runTs).map((sc) => fuzzyKey(sc.artist, sc.track))
   );
 
+  // A skipped track counts as consumed — the listener reached it and rejected it.
+  const measuredSkips = await loadMeasuredSkips();
+
   let played = 0;
+  let skipped = 0;
   let reached = 0;
   last.tracks.forEach((t, i) => {
-    if (since.has(fuzzyKey(t.artist, t.track))) {
+    const k = fuzzyKey(t.artist, t.track);
+    if (since.has(k)) {
       played++;
+      reached = i + 1;
+    } else if (measuredSkips.has(k)) {
+      skipped++;
       reached = i + 1;
     }
   });
 
   const total = last.tracks.length;
-  const consumed = Math.max(played, reached);
-  return { pct: consumed / total, played, reached, consumed, total, runDate: last.date };
+  const consumed = Math.max(played + skipped, reached);
+  return { pct: consumed / total, played, skipped, reached, consumed, total, runDate: last.date };
 }
 
 // Infer dislikes without asking the user to rate anything. Spotify's API does
@@ -716,11 +725,17 @@ async function inferSkippedTracks(runHistory, minRuns = 2) {
     }
   }
 
+  // A measured skip is direct evidence, so one is enough. Absence of a scrobble
+  // is only circumstantial — it needs `minRuns` offers before it counts.
+  const measuredSkips = await loadMeasuredSkips();
+
   const keys = new Set();
+  let measured = 0;
   for (const [k, n] of offeredCounts) {
+    if (measuredSkips.has(k)) { keys.add(k); measured++; continue; }
     if (n >= minRuns && !scrobbled.has(k)) keys.add(k);
   }
-  return { keys, offeredCounts, labels };
+  return { keys, offeredCounts, labels, measured };
 }
 
 // ---------------------------------------------------------------------------
@@ -996,6 +1011,64 @@ async function findSeeds(accessToken, tracklists, lastfmData, feedback, bucketIn
 // Get recently played tracks for exclusion (don't recommend what they just heard)
 // ---------------------------------------------------------------------------
 
+// Measured skip detection.
+//
+// Spotify exposes no skip flag, but /me/player/recently-played carries played_at
+// per item and duration_ms per track. The gap between consecutive plays is how
+// long the earlier track actually ran, so a track that ran well short of its
+// length was skipped.
+//
+// Two things this cannot see: the last track before a session ends (the gap
+// then measures idle time, not playback), and skips under ~30s, which Spotify
+// omits from the endpoint entirely. Observations accumulate on disk because the
+// endpoint only returns the last 50 plays.
+const SKIP_FRACTION = 0.6;      // ran less than this proportion => skipped
+const SESSION_SLACK_S = 120;    // tolerated pause before a gap is unmeasurable
+
+async function recordSkips(items) {
+  const store = (await loadJson(SKIPS_PATH)) || {};
+  let newSkips = 0, newPlays = 0;
+
+  // items are newest-first, so items[i + 1] is the track that played before items[i]
+  for (let i = 0; i < items.length - 1; i++) {
+    const earlier = items[i + 1];
+    const durS = (earlier.track?.duration_ms || 0) / 1000;
+    if (!durS) continue;
+
+    const gapS = (Date.parse(items[i].played_at) - Date.parse(earlier.played_at)) / 1000;
+    if (gapS <= 0) continue;
+    if (gapS > durS + SESSION_SLACK_S) continue; // session break or long pause
+
+    const key = fuzzyKey(earlier.track.artists?.[0]?.name || "", earlier.track.name || "");
+    const ts = earlier.played_at;
+    const rec = store[key] || { plays: 0, skips: 0, lastTs: null, lastFraction: null };
+    if (rec.lastTs === ts) continue; // already recorded this play
+
+    const fraction = Math.min(gapS / durS, 1);
+    if (fraction < SKIP_FRACTION) { rec.skips++; newSkips++; }
+    else { rec.plays++; newPlays++; }
+    rec.lastTs = ts;
+    rec.lastFraction = Math.round(fraction * 100) / 100;
+    store[key] = rec;
+  }
+
+  if (newSkips || newPlays) {
+    await saveJson(SKIPS_PATH, store);
+    log(`Skip detection: ${newSkips} skipped, ${newPlays} played through (${Object.keys(store).length} tracked)`);
+  }
+  return store;
+}
+
+// Tracks measured as skipped and never once played through.
+async function loadMeasuredSkips() {
+  const store = (await loadJson(SKIPS_PATH)) || {};
+  const keys = new Set();
+  for (const [k, v] of Object.entries(store)) {
+    if (v.skips > 0 && v.plays === 0) keys.add(k);
+  }
+  return keys;
+}
+
 async function getRecentlyPlayed(accessToken) {
   // Soft filter: only the last 50 actually-played tracks, so we don't
   // recommend something the user just heard. Top-tracks lists are not
@@ -1003,6 +1076,9 @@ async function getRecentlyPlayed(accessToken) {
   // might like this"). Heavily-played tracks are filtered separately
   // via the Last.fm play-count threshold in findCandidates.
   const recentlyPlayed = await spotifyGet("/me/player/recently-played", accessToken, { limit: 50 });
+
+  // Same payload already carries what skip detection needs — no extra call.
+  await recordSkips(recentlyPlayed.items || []);
 
   const played = new Set();
   for (const item of recentlyPlayed.items || []) {
@@ -1160,7 +1236,7 @@ async function findCandidates(seeds, recentlyPlayed, accessToken, targetCount = 
     }
     if (inferred.keys.size > 0) {
       const sample = [...inferred.keys].slice(0, 5).map((k) => inferred.labels.get(k) || k);
-      log(`Excluding ${inferred.keys.size} inferred dislikes (offered 2+ times, never played): ${sample.join("; ")}${inferred.keys.size > 5 ? "; …" : ""}`);
+      log(`Excluding ${inferred.keys.size} inferred dislikes (${inferred.measured} measured skips, rest offered 2+ times and never played): ${sample.join("; ")}${inferred.keys.size > 5 ? "; …" : ""}`);
     }
   }
 
@@ -2572,27 +2648,6 @@ async function main() {
       process.exit(1);
     }
 
-    // Hold off refreshing until the last playlist has actually been worked
-    // through. Exits 0, not 1 — a deliberate skip is not a failure, and a
-    // scheduled run should not report red for it.
-    if (minConsumed > 0) {
-      const used = await lastRunConsumption(await loadRunHistory());
-      if (used && used.pct < minConsumed) {
-        console.log(
-          `\nSkipping refresh: ${(used.pct * 100).toFixed(0)}% of the last ${PLAYLIST_NAME} ` +
-          `playlist consumed (${used.consumed}/${used.total}), below the ${(minConsumed * 100).toFixed(0)}% threshold.`
-        );
-        console.log(`  ${used.played} tracks played, reached position ${used.reached} of ${used.total} (run of ${used.runDate}).`);
-        console.log(`  Run without --min-consumed to refresh anyway.\n`);
-        process.exit(0);
-      }
-      if (used) {
-        log(`Last playlist ${(used.pct * 100).toFixed(0)}% consumed (${used.consumed}/${used.total}) — refreshing`);
-      } else {
-        log(`No consumption data for ${mode} yet — refreshing`);
-      }
-    }
-
     const feedback = await loadFeedback();
     if (feedback.liked.length > 0 || feedback.skipped.length > 0) {
       log(`Feedback loaded: ${feedback.liked.length} liked, ${feedback.skipped.length} skipped`);
@@ -2609,6 +2664,28 @@ async function main() {
     } else {
       log(`Bucket: ${bucketInfo.currentBucket} (${bucketInfo.totalInBucket}/${bucketInfo.totalScrobbles} scrobbles in this bucket)`);
     }
+
+    // Hold off refreshing until the last playlist has actually been worked
+    // through. Exits 0, not 1 — a deliberate skip is not a failure, and a
+    // scheduled run should not report red for it.
+    if (minConsumed > 0) {
+      const used = await lastRunConsumption(await loadRunHistory());
+      if (used && used.pct < minConsumed) {
+        console.log(
+          `\nSkipping refresh: ${(used.pct * 100).toFixed(0)}% of the last ${PLAYLIST_NAME} ` +
+          `playlist consumed (${used.consumed}/${used.total}), below the ${(minConsumed * 100).toFixed(0)}% threshold.`
+        );
+        console.log(`  ${used.played} played, ${used.skipped} skipped, reached position ${used.reached} of ${used.total} (run of ${used.runDate}).`);
+        console.log(`  Run without --min-consumed to refresh anyway.\n`);
+        process.exit(0);
+      }
+      if (used) {
+        log(`Last playlist ${(used.pct * 100).toFixed(0)}% consumed (${used.consumed}/${used.total}) — refreshing`);
+      } else {
+        log(`No consumption data for ${mode} yet — refreshing`);
+      }
+    }
+
 
     const seeds = await findSeeds(tokens.access_token, tracklists, lastfmData, feedback, bucketInfo);
 
