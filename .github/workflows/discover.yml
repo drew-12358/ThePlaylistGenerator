@@ -86,16 +86,16 @@ jobs:
       - name: Refresh scrobbles
         run: node fetch-scrobbles.mjs
 
-      # Only refresh a playlist once 75% of it has been listened to or skipped
+      # Only refresh a playlist once 60% of it has been listened to or skipped
       # past. Below that the run exits 0 without touching Spotify, so a daily
       # schedule self-throttles to the pace it actually gets played.
       - name: Refresh Discovery Chill
         if: ${{ github.event_name == 'schedule' || inputs.modes == 'both' || inputs.modes == 'chill' }}
-        run: node discover.mjs --mode chill ${{ inputs.force && ' ' || '--min-consumed 0.75' }}
+        run: node discover.mjs --mode chill ${{ inputs.force && ' ' || '--min-consumed 0.6' }}
 
       - name: Refresh Discovery Heavy
         if: ${{ github.event_name == 'schedule' || inputs.modes == 'both' || inputs.modes == 'hard' }}
-        run: node discover.mjs --mode hard ${{ inputs.force && ' ' || '--min-consumed 0.75' }}
+        run: node discover.mjs --mode hard ${{ inputs.force && ' ' || '--min-consumed 0.6' }}
 
       - name: Remove credentials
         if: always()
