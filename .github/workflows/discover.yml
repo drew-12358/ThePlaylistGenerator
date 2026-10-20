@@ -59,14 +59,9 @@ jobs:
           set -euo pipefail
           mkdir -p ~/.spotify-discover
           printf '%s' "$SPOTIFY_CONFIG" > ~/.spotify-discover/config.json
-          # Only seed tokens if the cache didn't already carry a fresher set —
-          # the engine rewrites tokens.json on refresh and the cache preserves it.
-          if [ ! -s ~/.spotify-discover/tokens.json ]; then
-            printf '%s' "$SPOTIFY_TOKENS" > ~/.spotify-discover/tokens.json
-            echo "Seeded tokens.json from secret"
-          else
-            echo "Using cached tokens.json"
-          fi
+          # Always take tokens from the secret. Preferring the cached copy meant a
+          # revoked cached token could never be replaced, deadlocking every run.
+          printf '%s' "$SPOTIFY_TOKENS" > ~/.spotify-discover/tokens.json
           {
             echo "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY"
             echo "LASTFM_API_KEY=$LASTFM_API_KEY"
@@ -91,11 +86,11 @@ jobs:
       # schedule self-throttles to the pace it actually gets played.
       - name: Refresh Discovery Chill
         if: ${{ github.event_name == 'schedule' || inputs.modes == 'both' || inputs.modes == 'chill' }}
-        run: node discover.mjs --mode chill ${{ inputs.force && ' ' || '--min-consumed 0.6' }}
+        run: node discover.mjs --mode chill ${{ inputs.force && ' ' || '--min-consumed 0.6 --max-age-days 7' }}
 
       - name: Refresh Discovery Heavy
         if: ${{ github.event_name == 'schedule' || inputs.modes == 'both' || inputs.modes == 'hard' }}
-        run: node discover.mjs --mode hard ${{ inputs.force && ' ' || '--min-consumed 0.6' }}
+        run: node discover.mjs --mode hard ${{ inputs.force && ' ' || '--min-consumed 0.6 --max-age-days 7' }}
 
       - name: Remove credentials
         if: always()

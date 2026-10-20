@@ -138,6 +138,9 @@ const excludeRuns = args.includes("--exclude-runs")
 const minConsumed = args.includes("--min-consumed")
   ? parseFloat(args[args.indexOf("--min-consumed") + 1]) || 0
   : 0;
+const maxAgeDays = args.includes("--max-age-days")
+  ? parseFloat(args[args.indexOf("--max-age-days") + 1]) || Infinity
+  : 7;
 const modeArg = args[args.indexOf("--mode") + 1];
 const mode = (modeArg && MODE_CONFIG[modeArg]) ? modeArg : "chill";
 const MODE = MODE_CONFIG[mode];
@@ -692,9 +695,14 @@ async function lastRunConsumption(runHistory) {
     }
   });
 
+  // Count only tracks with evidence. Positional inference ("track 42 played, so
+  // 1-42 were consumed") over-counted badly under shuffle: 17 plays reaching
+  // position 42 scored 70% when true consumption was 28%. `reached` is kept for
+  // the log line only.
   const total = last.tracks.length;
-  const consumed = Math.max(played + skipped, reached);
-  return { pct: consumed / total, played, skipped, reached, consumed, total, runDate: last.date };
+  const consumed = played + skipped;
+  const ageDays = (Date.now() / 1000 - runTs) / 86400;
+  return { pct: consumed / total, played, skipped, reached, consumed, total, ageDays, runDate: last.date };
 }
 
 // Infer dislikes without asking the user to rate anything. Spotify's API does
@@ -1794,6 +1802,15 @@ async function authorizeUser(config) {
   authUrl.searchParams.set("scope", SCOPES);
   authUrl.searchParams.set("state", state);
 
+  // No browser on CI. Fail immediately instead of burning the 2-minute callback
+  // timeout and reporting a vague authorization error.
+  if (process.env.CI) {
+    throw new Error(
+      "Spotify refresh token is invalid and no browser is available on CI. " +
+      "Re-run `node discover.mjs --auth` locally, update the SPOTIFY_TOKENS secret, then clear the Actions cache."
+    );
+  }
+
   console.log("\nOpening browser for Spotify authorization...");
   console.log("If it doesn't open, visit this URL:\n");
   console.log(`  ${authUrl.toString()}\n`);
@@ -2670,7 +2687,9 @@ async function main() {
     // scheduled run should not report red for it.
     if (minConsumed > 0) {
       const used = await lastRunConsumption(await loadRunHistory());
-      if (used && used.pct < minConsumed) {
+      if (used && used.ageDays >= maxAgeDays) {
+        log(`Last playlist is ${used.ageDays.toFixed(1)} days old (>= ${maxAgeDays}) — refreshing regardless of ${(used.pct * 100).toFixed(0)}% consumed`);
+      } else if (used && used.pct < minConsumed) {
         console.log(
           `\nSkipping refresh: ${(used.pct * 100).toFixed(0)}% of the last ${PLAYLIST_NAME} ` +
           `playlist consumed (${used.consumed}/${used.total}), below the ${(minConsumed * 100).toFixed(0)}% threshold.`
