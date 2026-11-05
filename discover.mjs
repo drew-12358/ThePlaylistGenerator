@@ -76,6 +76,7 @@ const DECISIVE_HARD_TAGS = new Set([
   "thrash metal", "death metal", "black metal", "doom metal", "sludge metal",
   "speed metal", "power metal", "metalcore", "deathcore", "djent", "mathcore",
   "grindcore", "powerviolence", "industrial", "industrial rock", "ebm", "aggrotech",
+  "rapcore", "rap metal",
 ]);
 const HARD_TAG_TO_GROUP = new Map();
 for (const [group, tags] of Object.entries(HARD_TAG_GROUPS)) {
@@ -537,6 +538,14 @@ async function getArtistSimilar(artistName, limit = 15) {
   return artists;
 }
 
+// Either one unambiguous heavy tag, or two distinct heavy groups — so a lone
+// "metal" on an otherwise non-heavy artist doesn't disqualify them.
+function isHeavyTagged(tags, blocklist) {
+  if (!blocklist) return false;
+  if (tags.some((t) => DECISIVE_HARD_TAGS.has(t))) return true;
+  return tagsMatchAllowlist(tags, blocklist, 2);
+}
+
 function tagsMatchAllowlist(tags, allowlist, minDistinctGroups = 1) {
   if (!allowlist) return true;
   const matchedGroups = new Set();
@@ -953,10 +962,7 @@ async function findSeeds(accessToken, tracklists, lastfmData, feedback, bucketIn
     const blocked = [];
     const kept = seeds.filter((s) => {
       const tags = artistTagCache.get(s.artist.toLowerCase()) || [];
-      // Either one unambiguous heavy tag, or two distinct heavy groups — so a
-      // lone "metal" on an otherwise non-heavy artist doesn't disqualify them.
-      const decisive = tags.some((t) => DECISIVE_HARD_TAGS.has(t));
-      if (decisive || tagsMatchAllowlist(tags, MODE.seedGenreBlocklist, 2)) {
+      if (isHeavyTagged(tags, MODE.seedGenreBlocklist)) {
         blocked.push(s.artist);
         return false;
       }
@@ -1566,6 +1572,27 @@ async function findCandidates(seeds, recentlyPlayed, accessToken, targetCount = 
     candidates.push(...filtered);
     if (candidates.length === 0) {
       throw new Error(`No candidates survived the hard-mode genre filter. Check seeds in ${MODE.seedFile} — they need to trace back to heavy music.`);
+    }
+  }
+
+  // Chill blocklist on candidates too. Filtering seeds alone left heavy artists
+  // arriving from non-heavy seeds — Rage Against The Machine reached Chill that
+  // way, since it is never a Chill seed.
+  if (MODE.seedGenreBlocklist) {
+    const before = candidates.length;
+    const dropped = [];
+    const kept = candidates.filter((c) => {
+      if (isHeavyTagged(c.genres || [], MODE.seedGenreBlocklist)) {
+        dropped.push(c.artist);
+        return false;
+      }
+      return true;
+    });
+    if (dropped.length > 0) {
+      const names = [...new Set(dropped)];
+      log(`Genre blocklist [${mode}]: cut ${before - kept.length}/${before} heavy candidates: ${names.slice(0, 8).join(", ")}${names.length > 8 ? `, +${names.length - 8} more` : ""}`);
+      candidates.length = 0;
+      candidates.push(...kept);
     }
   }
 
