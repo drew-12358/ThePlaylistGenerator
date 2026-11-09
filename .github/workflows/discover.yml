@@ -90,7 +90,7 @@ jobs:
 
       - name: Refresh Discovery Heavy
         if: ${{ github.event_name == 'schedule' || inputs.modes == 'both' || inputs.modes == 'hard' }}
-        run: node discover.mjs --mode hard ${{ inputs.force && ' ' || '--min-consumed 0.6 --max-age-days 7' }}
+        run: node discover.mjs --mode hard --count 30 ${{ inputs.force && ' ' || '--min-consumed 0.6 --max-age-days 7' }}
 
       - name: Remove credentials
         if: always()
