@@ -1161,7 +1161,8 @@ async function findCandidates(seeds, recentlyPlayed, accessToken, targetCount = 
     log(`Bucket-boosted seeds (+1 slot): ${bucketBoosted.size}`);
   }
 
-  const MAX_PER_ARTIST = 3;
+  // 3 of 60 is 5% of a playlist; 3 of 30 is 10% and reads as repetition.
+  const MAX_PER_ARTIST = trackCount <= 35 ? 2 : 3;
   const candidates = [];
   const seenTracks = new Set();
   const seenArtists = new Map();
@@ -2772,7 +2773,13 @@ async function main() {
     // 2-3. Find candidates via Last.fm similarity → resolve on Spotify
     // Hard mode needs a larger raw pool because the genre filter is strict — use 6× target
     // so track.getSimilar processes all seeds rather than stopping early.
-    const rawTarget = MODE.genreAllowlist ? Math.round(trackCount * 6) : Math.round(trackCount * 1.4);
+    // Selection freedom is what the curator needs, and it is absolute, not
+    // proportional: 1.4x gave 84 candidates for 60 tracks (24 spare), but only
+    // 42 for 30 (6 spare), which left no room to balance decades or genres
+    // while the exclusion set stayed just as large.
+    const rawTarget = MODE.genreAllowlist
+      ? Math.round(trackCount * 6)
+      : Math.max(Math.round(trackCount * 1.4), trackCount + 50);
     const candidateTracks = await findCandidates(seeds, recentlyPlayed, tokens.access_token, rawTarget, excludeRuns, feedback, lastfmData);
 
     log(`${candidateTracks.length} candidates ready for curation`);
