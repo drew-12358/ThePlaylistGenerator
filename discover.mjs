@@ -268,9 +268,20 @@ async function saveFeedback(fb) {
   await writeFile(feedbackPath(), JSON.stringify(fb, null, 2));
 }
 
+const VARIANT_WORDS = "remaster|remastered|deluxe|bonus|remix|live|mono|stereo|radio|single|album|edit|version|mix|demo|feat\\.?|featuring|with";
+
 function fuzzyKey(artist, track) {
-  return `${artist} - ${track}`.toLowerCase()
-    .replace(/\s*[-–—]\s*(remaster|remastered|deluxe|bonus|remix|live|mono|stereo|radio|single|album|edit|\d{4}).*$/i, "");
+  // Normalise the title alone. Doing it on "artist - track" let the separator
+  // itself be treated as a variant marker, so any title starting with one of
+  // these words ("Live and Let Die") collapsed to just the artist.
+  const t = String(track).toLowerCase()
+    // "Them Bones - 2022 Remaster"
+    .replace(new RegExp(`\\s*[-–—]\\s*[^-–—]*(${VARIANT_WORDS}|\\d{4}).*$`, "i"), "")
+    // "Them Bones (2022 Remaster)", "Award Tour (feat. Trugoy The Dove)" —
+    // Last.fm reports the bare title, Spotify the decorated one.
+    .replace(new RegExp(`\\s*[\\(\\[][^)\\]]*(${VARIANT_WORDS})[^)\\]]*[\\)\\]]\\s*`, "gi"), "")
+    .trim();
+  return `${String(artist).toLowerCase()} - ${t}`;
 }
 
 function dedupeFeedback(arr) {
@@ -1615,6 +1626,17 @@ async function findCandidates(seeds, recentlyPlayed, accessToken, targetCount = 
   let cacheHits = 0;
   let searched = 0;
   let rateLimited = 0;
+  let excludedAfterResolve = 0;
+
+  // Exclusions are tested on Last.fm titles, but run history stores the
+  // resolved Spotify titles, which often differ ("Them Bones" vs "Them Bones
+  // (2022 Remaster)", "Marvin Gaye" vs "Marvin Gaye & Tammi Terrell"). Re-test
+  // once the real title is known, so repeats cannot slip through on a spelling.
+  const stillExcluded = (artist, name) => {
+    const k = fuzzyKey(artist, name);
+    if (excludeKeys.has(k)) { excludedAfterResolve++; return true; }
+    return false;
+  };
 
   for (const c of candidates) {
     // Spotify recs candidates already have a URI — skip search
@@ -1641,6 +1663,7 @@ async function findCandidates(seeds, recentlyPlayed, accessToken, targetCount = 
     const hit = trackUriCache.get(cacheKey);
     if (hit) {
       cacheHits++;
+      if (stillExcluded(hit.artist, hit.name)) continue;
       if (resolvedUris.has(hit.uri)) continue;
       resolvedUris.add(hit.uri);
       resolved.push({
@@ -1683,6 +1706,7 @@ async function findCandidates(seeds, recentlyPlayed, accessToken, targetCount = 
           popularity: match.popularity ?? null,
         };
         trackUriCache.set(cacheKey, entry);
+        if (stillExcluded(entry.artist, entry.name)) continue;
 
         // Dedup by URI — same track can appear from different seeds
         if (resolvedUris.has(match.uri)) continue;
@@ -1721,7 +1745,7 @@ async function findCandidates(seeds, recentlyPlayed, accessToken, targetCount = 
   }
 
   await saveTrackUriCache();
-  log(`Resolved ${resolved.length}/${candidates.length} on Spotify (${cacheHits} from cache, ${searched} searched, ${notFound} not found)`);
+  log(`Resolved ${resolved.length}/${candidates.length} on Spotify (${cacheHits} from cache, ${searched} searched, ${notFound} not found, ${excludedAfterResolve} excluded after resolve)`);
   // Signature-hit checks run after the artist pass saved, so persist again to
   // capture everything this run learned.
   await saveArtistTopTracksCache();
