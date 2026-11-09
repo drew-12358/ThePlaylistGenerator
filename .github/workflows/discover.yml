@@ -86,7 +86,7 @@ jobs:
       # schedule self-throttles to the pace it actually gets played.
       - name: Refresh Discovery Chill
         if: ${{ github.event_name == 'schedule' || inputs.modes == 'both' || inputs.modes == 'chill' }}
-        run: node discover.mjs --mode chill ${{ inputs.force && ' ' || '--min-consumed 0.6 --max-age-days 7' }}
+        run: node discover.mjs --mode chill --count 30 ${{ inputs.force && ' ' || '--min-consumed 0.6 --max-age-days 7' }}
 
       - name: Refresh Discovery Heavy
         if: ${{ github.event_name == 'schedule' || inputs.modes == 'both' || inputs.modes == 'hard' }}
