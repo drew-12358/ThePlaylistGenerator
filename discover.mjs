@@ -2549,7 +2549,7 @@ async function refreshPlaylist(resolvedTracks, accessToken) {
   // Create if doesn't exist
   if (!playlistId) {
     log("Creating new playlist...");
-    const created = await spotifyPost(`/users/${userId}/playlists`, accessToken, {
+    const created = await spotifyPost("/me/playlists", accessToken, {
       name: PLAYLIST_NAME,
       description: `${MODE.description} Last updated: ${new Date().toLocaleDateString()}.`,
       public: false,
