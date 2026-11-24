@@ -1161,8 +1161,8 @@ async function findCandidates(seeds, recentlyPlayed, accessToken, targetCount = 
     log(`Bucket-boosted seeds (+1 slot): ${bucketBoosted.size}`);
   }
 
-  // 3 of 60 is 5% of a playlist; 3 of 30 is 10% and reads as repetition.
-  const MAX_PER_ARTIST = trackCount <= 35 ? 2 : 3;
+  // Keep any one artist to roughly 10% of the playlist or less.
+  const MAX_PER_ARTIST = trackCount <= 15 ? 1 : trackCount <= 35 ? 2 : 3;
   const candidates = [];
   const seenTracks = new Set();
   const seenArtists = new Map();
