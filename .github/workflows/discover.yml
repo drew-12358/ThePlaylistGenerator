@@ -9,8 +9,8 @@ on:
       modes:
         description: 'Which playlists to refresh'
         type: choice
-        options: [both, chill, hard]
-        default: both
+        options: [all, chill, hard, sing]
+        default: all
       force:
         description: 'Refresh even if the last playlist is barely played'
         type: boolean
@@ -85,12 +85,16 @@ jobs:
       # past. Below that the run exits 0 without touching Spotify, so a daily
       # schedule self-throttles to the pace it actually gets played.
       - name: Refresh Discovery Chill
-        if: ${{ github.event_name == 'schedule' || inputs.modes == 'both' || inputs.modes == 'chill' }}
+        if: ${{ github.event_name == 'schedule' || inputs.modes == 'all' || inputs.modes == 'chill' }}
         run: node discover.mjs --mode chill --count 10 ${{ inputs.force && ' ' || '--min-consumed 0.6 --max-age-days 7' }}
 
       - name: Refresh Discovery Heavy
-        if: ${{ github.event_name == 'schedule' || inputs.modes == 'both' || inputs.modes == 'hard' }}
+        if: ${{ github.event_name == 'schedule' || inputs.modes == 'all' || inputs.modes == 'hard' }}
         run: node discover.mjs --mode hard --count 10 ${{ inputs.force && ' ' || '--min-consumed 0.6 --max-age-days 7' }}
+
+      - name: Refresh Chill #2 (singalong)
+        if: ${{ github.event_name == 'schedule' || inputs.modes == 'all' || inputs.modes == 'sing' }}
+        run: node discover.mjs --mode sing --count 10 ${{ inputs.force && ' ' || '--min-consumed 0.6 --max-age-days 7' }}
 
       - name: Remove credentials
         if: always()

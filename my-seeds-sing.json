@@ -1,0 +1,37 @@
+{
+  "description": "Songs comfortably in a baritone's range. Seeds only — the Sing playlist explores out from these.",
+  "tracks": [
+    {
+      "artist": "Teddy Swims",
+      "track": "Make You Feel My Love"
+    },
+    {
+      "artist": "Otis Redding",
+      "track": "(Sittin' On) The Dock of the Bay"
+    },
+    {
+      "artist": "Eddie Vedder",
+      "track": "Society"
+    },
+    {
+      "artist": "Eddie Vedder",
+      "track": "Guaranteed"
+    },
+    {
+      "artist": "Eddie Vedder",
+      "track": "Long Nights"
+    },
+    {
+      "artist": "Chris Whitley",
+      "track": "Dirt Floor"
+    },
+    {
+      "artist": "Chris Whitley",
+      "track": "Scrapyard Lullaby"
+    },
+    {
+      "artist": "Chris Whitley",
+      "track": "Ball Peen Hammer"
+    }
+  ]
+}

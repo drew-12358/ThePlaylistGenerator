@@ -84,6 +84,24 @@ for (const [group, tags] of Object.entries(HARD_TAG_GROUPS)) {
 }
 
 const MODE_CONFIG = {
+  sing: {
+    playlistName: "Chill #2",
+    seedFile: "my-seeds-sing.json",
+    albumsFile: "my-albums.json",
+    // Only the hand-picked singable seeds; recent listening and the album
+    // collection would pull in everything, heavy and high-tenor alike.
+    seedFileOnly: true,
+    genreAllowlist: null,
+    seedGenreBlocklist: HARD_TAGS,
+    artistDiscoveryBudget: 0.5,
+    decadeTargets: { "70s": 0.08, "80s": 0.20, "90s": 0.20, "00s": 0.20, "10s": 0.20, "20s": 0.12 },
+    description: "Songs in a baritone's range, curated by AI.",
+    // Target range comes from songs the listener can sing: Dock of the Bay
+    // (sung ~E3-G4), Eddie Vedder, Teddy Swims' Make You Feel My Love, Chris
+    // Whitley's Dirt Floor. No per-song range data exists, so this is the
+    // curator's judgement, not a measurement.
+    tagline: "songs a baritone can comfortably sing along to — melody mostly between about A2 and G4, peaking no higher than about A4, in the territory of Otis Redding's Dock of the Bay, Eddie Vedder, Teddy Swims and Chris Whitley's Dirt Floor. Cut tracks whose vocal sits high (sustained tenor belting, falsetto-led, or screamed vocals), even if they are otherwise good fits",
+  },
   chill: {
     playlistName: "Discovery Chill",
     seedFile: "my-seeds.json",
@@ -822,6 +840,7 @@ async function findSeeds(accessToken, tracklists, lastfmData, feedback, bucketIn
   const seeds = [];
   const addedKeys = new Set();
   for (const [key, track] of recentTracks) {
+    if (MODE.seedFileOnly) break;
     if (albumTrackLookup.has(key)) {
       addedKeys.add(key);
       seeds.push({
@@ -865,7 +884,7 @@ async function findSeeds(accessToken, tracklists, lastfmData, feedback, bucketIn
       const j = Math.floor(Math.random() * (i + 1));
       [pool[i], pool[j]] = [pool[j], pool[i]];
     }
-    const sampleSize = Math.max(1, Math.ceil(pool.length * 0.6));
+    const sampleSize = MODE.seedFileOnly ? pool.length : Math.max(1, Math.ceil(pool.length * 0.6));
     let added = 0;
     for (const s of pool.slice(0, sampleSize)) {
       const key = `${s.artist} - ${s.track}`.toLowerCase()
@@ -919,7 +938,7 @@ async function findSeeds(accessToken, tracklists, lastfmData, feedback, bucketIn
   const targetTotal = Math.ceil(historySeeds / (1 - albumSeedPct));
   const albumSeedTarget = targetTotal - historySeeds;
 
-  if (albumPool.length > 0 && albumSeedTarget > 0) {
+  if (!MODE.seedFileOnly && albumPool.length > 0 && albumSeedTarget > 0) {
     // Pick one representative track per album, then shuffle and take albumSeedTarget
     const albumGroups = new Map();
     for (const t of albumPool) {
