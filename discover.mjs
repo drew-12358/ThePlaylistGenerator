@@ -1633,6 +1633,17 @@ async function findCandidates(seeds, recentlyPlayed, accessToken, targetCount = 
   // resolved Spotify titles, which often differ ("Them Bones" vs "Them Bones
   // (2022 Remaster)", "Marvin Gaye" vs "Marvin Gaye & Tammi Terrell"). Re-test
   // once the real title is known, so repeats cannot slip through on a spelling.
+  // Per-artist cap again on resolved names: two different Last.fm artist
+  // strings can resolve to the same Spotify artist (Noisia twice in Heavy).
+  const resolvedPerArtist = new Map();
+  const artistFull = (artist) => {
+    const a = resolveArtistAlias(String(artist || "").toLowerCase());
+    const n = resolvedPerArtist.get(a) || 0;
+    if (n >= MAX_PER_ARTIST) { excludedAfterResolve++; return true; }
+    resolvedPerArtist.set(a, n + 1);
+    return false;
+  };
+
   const stillExcluded = (artist, name) => {
     const k = fuzzyKey(artist, name);
     if (excludeKeys.has(k)) { excludedAfterResolve++; return true; }
@@ -1666,6 +1677,7 @@ async function findCandidates(seeds, recentlyPlayed, accessToken, targetCount = 
       cacheHits++;
       if (stillExcluded(hit.artist, hit.name)) continue;
       if (resolvedUris.has(hit.uri)) continue;
+      if (artistFull(hit.artist)) continue;
       resolvedUris.add(hit.uri);
       resolved.push({
         uri: hit.uri,
@@ -1711,6 +1723,7 @@ async function findCandidates(seeds, recentlyPlayed, accessToken, targetCount = 
 
         // Dedup by URI — same track can appear from different seeds
         if (resolvedUris.has(match.uri)) continue;
+        if (artistFull(entry.artist)) continue;
         resolvedUris.add(match.uri);
 
         resolved.push({
